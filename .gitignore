@@ -70,3 +70,13 @@ Testing/
 #custom
 *.zip
 vpn.nix
+
+# Runtime credentials must never enter a Git-backed flake.
+*.ovpn
+*.key
+*.pem
+*.p12
+*.pfx
+__pycache__/
+result
+result-*
