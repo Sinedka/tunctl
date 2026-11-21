@@ -1,4 +1,5 @@
 #include "vpnctl/core.hpp"
+#include <chrono>
 #include <ctime>
 #include <fcntl.h>
 #include <iostream>
@@ -8,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace vpn;
@@ -356,10 +358,12 @@ Json handle(const Json &j, uid_t uid) {
   }
   require(ctl("stop"), "candidate could not be stopped");
   fs::remove(pending);
-  std::string message = "OpenVPN initialization failed";
+  std::string message = "OpenVPN initialization failed; see journalctl -b -u "
+                        "vpnctl-tunnel.service";
   if (restore)
-    message += ctl("start") ? "; previous tunnel restored"
-                            : "; previous tunnel also failed";
+    message += (ctl("start") && initialized())
+                   ? "; previous tunnel restored"
+                   : "; previous tunnel also failed";
   else
     releaseGuard();
   fs::remove(transaction);
@@ -370,6 +374,20 @@ Json handle(const Json &j, uid_t uid) {
 } // namespace
 int main(int argc, char **argv) {
   umask(0077);
+  // systemctl start is called while the IPC handler holds the transaction lock.
+  // ExecStartPost must observe OpenVPN directly, without acquiring that lock.
+  if (argc == 2 && std::string_view(argv[1]) == "wait-ready") {
+    using namespace std::chrono_literals;
+    auto deadline = std::chrono::steady_clock::now() + 32s;
+    do {
+      if (initialized())
+        return 0;
+      std::this_thread::sleep_for(100ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    std::cerr
+        << "Timed out waiting for vpnctl0 and OpenVPN CONNECTED,SUCCESS\n";
+    return 1;
+  }
   try {
     bool refresh = argc == 2 && std::string(argv[1]) == "refresh";
     Json j;

@@ -7,12 +7,13 @@ ConditionPathExists=|/var/lib/vpnctl/active.ovpn
 ConditionPathExists=|/run/vpnctl/pending.ovpn
 
 [Service]
-Type=notify
+Type=exec
 RuntimeDirectory=vpnctl-tunnel
 RuntimeDirectoryMode=0700
 ExecStartPre=@CMAKE_INSTALL_FULL_LIBEXECDIR@/vpnctl-network fallback
 ExecStartPre=@CMAKE_INSTALL_FULL_LIBEXECDIR@/vpnctl-prepare
 ExecStart=openvpn --config /run/vpnctl-tunnel/client.ovpn --management /run/vpnctl-tunnel/management unix --mark 30291 --route-nopull --route-noexec --script-security 1 --remap-usr1 SIGTERM --disable-dco --verb 1 --pull-filter accept ifconfig --pull-filter accept topology --pull-filter accept ping --pull-filter accept peer-id --pull-filter accept cipher --pull-filter accept protocol-flags --pull-filter ignore ''
+ExecStartPost=@CMAKE_INSTALL_FULL_BINDIR@/vpnctl-daemon wait-ready
 ExecStartPost=@CMAKE_INSTALL_FULL_LIBEXECDIR@/vpnctl-network ready
 ExecStopPost=@CMAKE_INSTALL_FULL_LIBEXECDIR@/vpnctl-network clear
 TimeoutStartSec=35

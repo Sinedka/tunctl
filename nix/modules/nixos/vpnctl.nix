@@ -205,7 +205,7 @@ in
       serviceConfig = {
         RuntimeDirectory = "vpnctl-tunnel";
         RuntimeDirectoryMode = "0700";
-        Type = "notify";
+        Type = "exec";
         TimeoutStartSec = 35;
         TimeoutStopSec = 6;
         Restart = "always";
@@ -214,7 +214,10 @@ in
           (fallback "replace")
           "${cfg.package}/libexec/vpnctl-prepare"
         ];
-        ExecStartPost = ready;
+        ExecStartPost = [
+          "${daemon} wait-ready"
+          ready
+        ];
         ExecStopPost = fallback "del";
         ExecStart = lib.concatStringsSep " " [
           "${pkgs.openvpn}/sbin/openvpn"

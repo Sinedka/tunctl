@@ -56,7 +56,16 @@ self: {
     machine.succeed("su - tester -c 'vpnctl import ~/bundle'")
     machine.succeed("su - tester -c 'TERM=xterm printf 2q | TERM=xterm script -qec vpnctl /dev/null' | grep VPNCTL")
 
-    machine.succeed("su - tester -c 'vpnctl connect first'")
+    # Hold the peer until after the client process starts but before any TLS reply.
+    machine.succeed("kill -STOP $(cat /tmp/vpntest/server.pid)")
+    machine.succeed("systemd-run --unit=test-vpnctl-connect --property=User=tester --property=RemainAfterExit=yes -- $(command -v vpnctl) connect first")
+    machine.wait_until_succeeds("test -S /run/vpnctl-tunnel/management && test $(systemctl show -p SubState --value vpnctl-tunnel) = start-post")
+    machine.succeed("test ! -e /sys/class/net/vpnctl0 && ip route show table 30201 | grep 'unreachable default'")
+    machine.fail("ping -c1 -W1 192.0.2.2")
+    machine.succeed("kill -CONT $(cat /tmp/vpntest/server.pid)")
+    machine.wait_for_unit("vpnctl-tunnel.service")
+    machine.wait_until_succeeds("test $(systemctl show -p SubState --value test-vpnctl-connect) = exited")
+    machine.succeed("test $(systemctl show -p ExecMainStatus --value test-vpnctl-connect) = 0")
     machine.succeed("su - tester -c 'vpnctl status' | jq -e '.state == \"connected\"'")
     machine.succeed("ping -c1 -W2 10.44.0.1")
     machine.succeed("su - tester -c 'vpnctl diag ping 10.44.0.1 vpn' | jq -e '.received == 4 and .avg_ms >= 0'")

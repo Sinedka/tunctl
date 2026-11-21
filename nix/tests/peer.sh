@@ -11,7 +11,7 @@ for name in server client; do
   openssl x509 -req -in $name.req -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile extensions -out $name.crt
 done
 ip -n peer link set lo up
-ip netns exec peer openvpn --daemon --log /tmp/server.log --local 192.0.2.1 --port 1194 --proto udp --dev tun --server 10.44.0.0 255.255.255.0 --topology subnet --ca ca.crt --cert server.crt --key server.key --dh none --disable-dco
+ip netns exec peer openvpn --daemon --writepid /tmp/vpntest/server.pid --log /tmp/server.log --local 192.0.2.1 --port 1194 --proto udp --dev tun --server 10.44.0.0 255.255.255.0 --topology subnet --ca ca.crt --cert server.crt --key server.key --dh none --disable-dco
 ip netns exec peer dnsmasq --bind-dynamic --listen-address=10.44.0.1,192.0.2.1 --address=/vpn-endpoint.test/192.0.2.1 --no-resolv --local-ttl=4 --address=/direct.test/192.0.2.2 --pid-file=/tmp/test-dns.pid
 mkdir -p /home/tester/bundle
 cp ca.crt client.crt client.key /home/tester/bundle/
