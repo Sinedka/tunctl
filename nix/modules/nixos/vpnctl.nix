@@ -104,39 +104,10 @@ in
     networking.nftables.enable = true;
     networking.nftables.tables.vpnctl = {
       family = "inet";
-      content = ''
-        set domains4 { type ipv4_addr; flags timeout; timeout 60s; }
-        set domains6 { type ipv6_addr; flags timeout; timeout 60s; }
-        set domainvpn4 { type ipv4_addr; flags timeout; timeout 300s; }
-        set domainvpn6 { type ipv6_addr; flags timeout; timeout 300s; }
-        chain applications {}
-        chain addresses {}
-        chain classify {
-          type route hook output priority mangle; policy accept;
-          oifname "lo" accept
-          meta mark 0x7653 accept
-          udp sport 68 udp dport 67 meta mark set 0x7652 accept
-          udp sport 546 udp dport 547 meta mark set 0x7652 accept
-          ip6 hoplimit 255 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } meta mark set 0x7652 accept
-          meta l4proto { tcp, udp } th dport { 53, 853 } meta mark set 0x7651 accept
-          jump applications
-          ${lib.concatMapStringsSep "\n" direct cfg.routing.directIPs}
-          jump addresses
-          ip daddr @domainvpn4 meta mark set 0x7651 accept
-          ip6 daddr @domainvpn6 meta mark set 0x7651 accept
-          ip daddr @domains4 meta mark set 0x7652 accept
-          ip6 daddr @domains6 meta mark set 0x7652 accept
-          meta mark set 0x7651
-        }
-        chain guard {
-          type filter hook output priority filter; policy accept;
-          ${lib.optionalString cfg.routing.killSwitch ''oifname != { "lo", "vpnctl0" } meta mark != { 0x7652, 0x7653 } counter drop''}
-        }
-        chain source {
-          type nat hook postrouting priority srcnat; policy accept;
-          oifname "vpnctl0" meta mark 0x7651 masquerade
-        }
-      '';
+      content = builtins.replaceStrings [ "%DIRECT_IPS%" "%GUARD%" ] [
+        (lib.concatMapStringsSep "\n" direct cfg.routing.directIPs)
+        (lib.optionalString cfg.routing.killSwitch ''oifname != { "lo", "vpnctl0" } meta mark != { 0x7652, 0x7653 } counter drop'')
+      ] (builtins.readFile ../../../packaging/routing.nft.in);
     };
     services.dnsmasq = lib.mkIf dns {
       enable = true;

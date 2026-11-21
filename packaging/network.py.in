@@ -1,0 +1,87 @@
+#!/usr/bin/python3
+"""Manage VPNCTL's reserved RPDB entries and nftables tables."""
+import ipaddress
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+GUARD = 'oifname != { "lo", "vpnctl0" } meta mark != { 0x7652, 0x7653 } counter drop'
+TABLE = "30201"
+POLICY = Path("/etc/vpnctl/policy.json")
+TEMPLATE = Path("@CMAKE_INSTALL_FULL_DATADIR@/vpnctl/routing.nft.in")
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def ruleset(config):
+    if type(config["killSwitch"]) is not bool:
+        raise ValueError("killSwitch must be boolean")
+    if not isinstance(config["operators"], list) or not all(isinstance(u, str) for u in config["operators"]):
+        raise ValueError("operators must be a list of usernames")
+    if config["policyUser"] and config["policyUser"] not in config["operators"]:
+        raise ValueError("policyUser must be an operator")
+    lines = []
+    for value in config["directIPs"]:
+        network = ipaddress.ip_network(value, strict=False)
+        family = "ip" if network.version == 4 else "ip6"
+        lines.append(f"{family} daddr {network} meta mark set 0x7652 accept")
+    content = TEMPLATE.read_text().replace("%DIRECT_IPS%", "\n".join(lines))
+    content = content.replace("%GUARD%", GUARD if config["killSwitch"] else "")
+    return "destroy table inet vpnctl\ntable inet vpnctl {\n" + content + "}\n"
+
+
+def rule_exists(family):
+    rows = json.loads(run("ip", family, "-j", "rule", "show", capture_output=True).stdout)
+    matches = [row for row in rows if row.get("priority") == int(TABLE)]
+    if matches and (len(matches) != 1 or str(matches[0].get("table")) != TABLE or
+                    matches[0].get("fwmark") not in (0x7651, "0x7651")):
+        raise ValueError(f"ip {family} rule priority {TABLE} is already in use")
+    return bool(matches)
+
+
+def routing():
+    batch = ruleset(json.loads(POLICY.read_text()))
+    missing = [family for family in ("-4", "-6") if not rule_exists(family)]
+    run("nft", "-f", "-", input=batch)
+    for family in missing:
+        run("ip", family, "rule", "add", "pref", TABLE, "fwmark", "0x7651", "lookup", TABLE)
+
+
+def main(op):
+    if op == "routing":
+        routing()
+    elif op == "stop-routing":
+        for family in ("-4", "-6"):
+            if rule_exists(family):
+                run("ip", family, "rule", "del", "pref", TABLE, "fwmark", "0x7651", "lookup", TABLE)
+        run("nft", "destroy", "table", "inet", "vpnctl")
+    elif op == "guard":
+        run("nft", "-f", "-", input="destroy table inet vpnctl_session\ntable inet vpnctl_session {\n"
+            "chain guard { type filter hook output priority filter; policy accept;\n" + GUARD + "\n}\n}\n")
+    elif op in ("fallback", "clear"):
+        for family in ("-4", "-6"):
+            args = ["ip", family, "route"]
+            if op == "clear":
+                existing = run(*args, "show", "table", TABLE, "type", "unreachable", capture_output=True)
+                if "unreachable default" not in existing.stdout:
+                    continue
+            run(*args, "replace" if op == "fallback" else "del", "unreachable", "default",
+                "metric", "42760", "table", TABLE)
+    elif op == "ready":
+        # Strict IPv4 rp_filter on some distributions would reject decrypted replies.
+        rp_filter = Path("/proc/sys/net/ipv4/conf/vpnctl0/rp_filter")
+        if rp_filter.read_text().strip() != "2":
+            rp_filter.write_text("2\n")
+        run("ip", "-4", "route", "replace", "default", "dev", "vpnctl0", "metric", "10", "table", TABLE)
+        addrs = json.loads(run("ip", "-6", "-j", "addr", "show", "dev", "vpnctl0", capture_output=True).stdout)
+        if any(a["scope"] == "global" for link in addrs for a in link["addr_info"]):
+            run("ip", "-6", "route", "replace", "default", "dev", "vpnctl0", "metric", "10", "table", TABLE)
+    else:
+        raise ValueError("unknown networking operation")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

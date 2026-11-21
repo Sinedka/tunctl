@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh VPNCTL routing exceptions
+Requires=vpnctl-routing.service
+After=vpnctl-routing.service
+
+[Service]
+Type=oneshot
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/vpnctl-daemon refresh
+StateDirectory=vpnctl
+StateDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ReadWritePaths=/run/vpnctl
+ProtectHome=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes

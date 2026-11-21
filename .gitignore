@@ -67,9 +67,9 @@ vcpkg_installed/
 Testing/
 .cache/
 
-#custom
+# Local provider archives and machine-specific VPN configuration
 *.zip
-vpn.nix
+/vpn*.nix
 
 # Runtime credentials must never enter a Git-backed flake.
 *.ovpn

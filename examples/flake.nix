@@ -1,9 +1,11 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    vpnctl.url = "git+file:///home/sinedka/tunctl";
+    vpnctl.url = "github:sinedka/tunctl";
     vpnctl.inputs.nixpkgs.follows = "nixpkgs";
-    home-manager.follows = "vpnctl/home-manager";
+    home-manager.url = "github:nix-community/home-manager/master";
+    home-manager.inputs.nixpkgs.follows = "nixpkgs";
+    vpnctl.inputs.home-manager.follows = "home-manager";
   };
   outputs = { nixpkgs, vpnctl, home-manager, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {

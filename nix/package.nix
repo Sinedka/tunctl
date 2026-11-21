@@ -38,6 +38,7 @@ stdenv.mkDerivation {
     ncurses
     python3
   ];
+  cmakeFlags = [ "-DVPNCTL_NATIVE_SYSTEMD=OFF" ];
   doCheck = true;
   postFixup = ''
     substituteInPlace $out/libexec/vpnctl-dns $out/libexec/vpnctl-prepare --replace-fail "#!${python3}/bin/python3" "#!${

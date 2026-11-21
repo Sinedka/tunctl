@@ -1,0 +1,10 @@
+[Unit]
+Description=Monitor VPNCTL cgroups and recover interrupted switches
+
+[Timer]
+OnBootSec=3s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

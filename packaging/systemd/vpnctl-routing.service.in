@@ -1,0 +1,20 @@
+[Unit]
+Description=VPNCTL host routing policy
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service nftables.service
+Before=network-pre.target NetworkManager.service systemd-networkd.service networking.service shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@CMAKE_INSTALL_FULL_LIBEXECDIR@/vpnctl-network routing
+ExecReload=@CMAKE_INSTALL_FULL_LIBEXECDIR@/vpnctl-network routing
+ExecReload=@CMAKE_INSTALL_FULL_BINDIR@/vpnctl-daemon refresh
+ExecStop=@CMAKE_INSTALL_FULL_LIBEXECDIR@/vpnctl-network stop-routing
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+[Install]
+RequiredBy=network-pre.target NetworkManager.service systemd-networkd.service networking.service

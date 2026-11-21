@@ -1,0 +1,10 @@
+{
+  "operators": [],
+  "policyUser": "",
+  "killSwitch": false,
+  "directIPs": [],
+  "directDomains": [],
+  "dns": false,
+  "upstreams": ["9.9.9.9"],
+  "bootstrapDNS": ["9.9.9.9"]
+}

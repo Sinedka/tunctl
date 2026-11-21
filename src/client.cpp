@@ -510,7 +510,7 @@ int tui() {
           search = prompt("Filter: ");
         if (k == 'i') {
           auto p = prompt("Profile / directory / ZIP: ");
-          message = output({"vpnctl-import", p}, 120, nullptr);
+          message = output({VPNCTL_IMPORT_HELPER, p}, 120, nullptr);
         }
         if (k == 'd')
           message = rpc({{"op", "disconnect"}}).dump();
@@ -694,9 +694,9 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (op == "validate" && a.size() == 2)
-      execute({"vpnctl-import", a[1], "--validate"});
+      execute({VPNCTL_IMPORT_HELPER, a[1], "--validate"});
     if (op == "import" && a.size() == 2)
-      execute({"vpnctl-import", a[1]});
+      execute({VPNCTL_IMPORT_HELPER, a[1]});
     if (op == "diag" && a.size() >= 2) {
       bool confirm = a.back() == "--confirm";
       if (confirm)

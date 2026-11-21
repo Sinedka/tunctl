@@ -18,7 +18,24 @@
 | Home Manager | Собирается конфигурация с IP, доменным и прикладным правилами, desktop entry и build-time проверкой JSON. VM отдельно проверяет отправку правил backend. Вход в графическую сессию, пользовательские темы, сброс и экспорт overrides остаются ручными сценариями. |
 | Boot и удаление | VM проверяет запуск socket и routing при загрузке. Автоподключение сохранённого профиля при повторной загрузке, откат поколения и удаление на существующем хосте требуют отдельной проверки. |
 
-## Воспроизведение
+## Нативные пакеты Linux
+
+На Debian 13 и Arch Linux x86_64 проверены сборка пакета, установка через APT или pacman, CTest и загрузка systemd units. Сквозной сценарий поднимает OpenVPN-сервер в отдельном network namespace, включает kill switch и импортирует профиль с внешними сертификатами. Оператор подключается через Unix-сокет. Затем обычный пользователь получает по HTTP через TUN контрольную строку и отключает VPN. Используются OpenVPN 2.6.14 на Debian и 2.7.9 на Arch.
+
+Для повторения нужен локальный образ с установленным пакетом VPNCTL, его зависимостями, systemd, bash, openssl и util-linux. Команды ниже запускаются из корня проекта. Подставьте имя своего образа в `image`.
+
+```sh
+image=localhost/vpnctl-test
+podman run -d --name vpnctl-native-test --systemd=always --network=none \
+  --device=/dev/net/tun --cap-add=NET_ADMIN --cap-add=SYS_ADMIN \
+  -v "$PWD/tests/native_tunnel.sh:/native-test:ro" "$image" /usr/lib/systemd/systemd
+podman exec vpnctl-native-test bash /native-test
+podman rm -f vpnctl-native-test
+```
+
+В rootless-контейнере с запрещёнными ICMP-сокетами пользовательский `ping` возвращает ошибку прав. Поэтому нативный тест проверяет передачу данных по TCP. Ping через TUN дополнительно проверяется в NixOS VM. Инструкции сборки и первого запуска приведены в [руководстве для Linux](linux.md).
+
+## Воспроизведение на NixOS
 
 ```sh
 nix build

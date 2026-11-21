@@ -1,0 +1,14 @@
+[Unit]
+Description=VPNCTL operator socket
+Requires=vpnctl-routing.service
+After=vpnctl-routing.service
+
+[Socket]
+ListenStream=/run/vpnctl/control.sock
+Accept=yes
+SocketMode=0660
+SocketGroup=vpnctl
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target
