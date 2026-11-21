@@ -1,6 +1,8 @@
+#include "picker.hpp"
 #include "vpnctl/core.hpp"
 #include <algorithm>
 #include <chrono>
+#include <clocale>
 #include <csignal>
 #include <cstring>
 #include <ctime>
@@ -299,8 +301,7 @@ int tui() {
     try {
       status = rpc({{"op", "status"}});
     } catch (const std::exception &e) {
-      status = {{"state", "unavailable"}};
-      message = e.what();
+      status = {{"state", "unavailable"}, {"lastError", e.what()}};
     }
     auto current =
         status.value("selected", "") + " " + status.value("state", "");
@@ -395,7 +396,8 @@ int tui() {
                     .value("checked", "-") +
                 (marked.contains(p["name"].get<std::string>()) ? "  [x]" : ""));
       }
-      help = "Enter connect   d disconnect   i import   x remove   / search   "
+      line(5, "i import file/ZIP   I import folder   v/V validate file/folder");
+      help = "Enter connect   d disconnect   x remove   / search   "
              "c country  p probe  Space mark  P batch  f fastest  o sort";
     }
     if (page == 2) {
@@ -466,6 +468,7 @@ int tui() {
       line(8, "System DIRECT IPs: " +
                   status.value("systemIPs", Json::array()).dump());
       line(10, "DNS domains: " + status.value("domains", Json::array()).dump());
+      line(12, "e  Export routing rules to a JSON file");
       help = "t theme    g ping target    s synchronize    r reset rules    q "
              "quit";
     }
@@ -515,9 +518,20 @@ int tui() {
       if (page == 1) {
         if (k == '/')
           search = prompt("Filter: ");
-        if (k == 'i') {
-          auto p = prompt("Profile / directory / ZIP: ");
-          message = output({importHelper(), p}, 120, nullptr);
+        if (k == 'i' || k == 'I' || k == 'v' || k == 'V') {
+          bool validate = k == 'v' || k == 'V';
+          auto mode =
+              k == 'I' || k == 'V' ? PickMode::directory : PickMode::profile;
+          auto path = choosePath(mode,
+                                 validate ? "Validate OpenVPN profiles"
+                                          : "Import OpenVPN profiles",
+                                 true);
+          if (path) {
+            Args cmd{importHelper(), *path};
+            if (validate)
+              cmd.insert(cmd.end(), {"--validate", executable()});
+            message = output(cmd, 120, nullptr);
+          }
         }
         if (k == 'd')
           message = rpc({{"op", "disconnect"}}).dump();
@@ -604,6 +618,20 @@ int tui() {
         fs::remove(overrides());
         message = "Declarative rules applied";
       }
+      if (page == 4 && k == 'e') {
+        if (auto path =
+                choosePath(PickMode::saveRules, "Save routing rules", true)) {
+          auto type = fs::symlink_status(*path).type();
+          require(type == fs::file_type::not_found ||
+                      type == fs::file_type::regular,
+                  "choose a regular file for export");
+          if (type == fs::file_type::not_found ||
+              prompt("Replace existing file? Type YES: ") == "YES") {
+            write(*path, rules().dump(2) + "\n");
+            message = "Saved " + path->string();
+          }
+        }
+      }
       if (page == 4 && (k == 't' || k == 'g')) {
         auto file = overrides().parent_path() / "preferences.json";
         auto pref = load(file, Json::object());
@@ -657,6 +685,7 @@ int tui() {
 } // namespace
 int main(int argc, char **argv) {
   try {
+    std::setlocale(LC_CTYPE, "");
     Args a(argv + 1, argv + argc);
     if (a.empty()) {
       require(geteuid() != 0, "run the TUI as a normal user");
@@ -665,7 +694,8 @@ int main(int argc, char **argv) {
     auto op = a[0];
     if (op == "--help" || op == "help") {
       std::cout << "vpnctl [status|connect NAME|disconnect|remove NAME|import "
-                   "PATH|sync|reset|export|launch APP COMMAND...|diag TEST "
+                   "[PATH]|validate [PATH]|check-settings "
+                   "[PATH]|sync|reset|export|launch APP COMMAND...|diag TEST "
                    "TARGET vpn|direct [--confirm]]\n";
       return 0;
     }
@@ -679,6 +709,15 @@ int main(int argc, char **argv) {
       if (live.at("allowDirectProbe") == true && live.at("rules") != r)
         sync(r);
       execute(scope(a[1], Args(a.begin() + 2, a.end())));
+    }
+    if ((op == "import" || op == "validate" || op == "check-settings") &&
+        a.size() == 1) {
+      auto mode =
+          op == "check-settings" ? PickMode::settings : PickMode::profile;
+      auto path = choosePath(mode, "VPNCTL: " + op, false);
+      if (!path)
+        return 0;
+      a.push_back(*path);
     }
     if (op == "check-settings" && a.size() == 2) {
       auto c = Json::parse(read(a[1]));

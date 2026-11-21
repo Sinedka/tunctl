@@ -5,6 +5,7 @@
   openssl,
   nlohmann_json,
   ncurses,
+  zenity,
   python3,
   makeWrapper,
   iproute2,
@@ -48,6 +49,7 @@ stdenv.mkDerivation {
       lib.makeBinPath [
         iproute2
         iputils
+        zenity
         getent
         curl
         dnsutils

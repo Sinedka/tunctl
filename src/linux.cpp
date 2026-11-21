@@ -35,7 +35,7 @@ void write(const fs::path &p, const std::string &s) {
     throw std::runtime_error("atomic write failed");
   }
 }
-Result run(const Args &args, int seconds, bool (*cancel)()) {
+Result run(const Args &args, int seconds, bool (*cancel)(), ProcessMode mode) {
   std::vector<char *> av;
   for (auto &s : args)
     av.push_back(const_cast<char *>(s.c_str()));
@@ -49,13 +49,18 @@ Result run(const Args &args, int seconds, bool (*cancel)()) {
     if (getppid() != parent)
       _exit(1);
     setpgid(0, 0);
-    setenv("LC_ALL", "C", 1);
+    int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null < 0)
+      _exit(127);
+    if (mode == ProcessMode::command)
+      setenv("LC_ALL", "C", 1);
     dup2(pp[1], 1);
-    dup2(pp[1], 2);
+    // GTK warnings must never become part of a selected filename.
+    dup2(mode == ProcessMode::desktopDialog ? null : pp[1], 2);
     close(pp[0]);
     close(pp[1]);
-    int null = open("/dev/null", O_RDONLY);
     dup2(null, 0);
+    close(null);
     execvp(av[0], av.data());
     _exit(127);
   }

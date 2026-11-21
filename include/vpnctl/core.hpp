@@ -24,7 +24,9 @@ struct Result {
   std::string output;
 };
 Json pingMetrics(const std::string &);
-Result run(const Args &, int seconds = 10, bool (*cancel)() = nullptr);
+enum class ProcessMode { command, desktopDialog };
+Result run(const Args &, int seconds = 10, bool (*cancel)() = nullptr,
+           ProcessMode mode = ProcessMode::command);
 void sendJson(int, const Json &);
 Json recvJson(int);
 Json rpc(const Json &);
