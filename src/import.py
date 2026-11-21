@@ -62,7 +62,8 @@ def submit(path, load):
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", path.stem)
     profile = expand(path, load)
     if "--validate" in sys.argv[2:]:
-        subprocess.run(["vpnctl","validate-stdin"],input=profile,text=True,check=True)
+        client = sys.argv[3] if len(sys.argv) == 4 else "vpnctl"
+        subprocess.run([client,"validate-stdin"],input=profile,text=True,check=True)
         print(name)
         return
     data = json.dumps(dict(op="import", name=name, profile=profile)).encode()

@@ -12,15 +12,3 @@ install(FILES "${native_dir}/tmpfiles.conf" DESTINATION lib/tmpfiles.d RENAME vp
 install(FILES "${native_dir}/policy.example.json" "${native_dir}/routing.nft.in"
         DESTINATION "${CMAKE_INSTALL_DATADIR}/vpnctl")
 install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/vpnctl")
-
-# Run cpack -G DEB in a native Debian build configured with prefix /usr.
-set(CPACK_GENERATOR DEB)
-set(CPACK_PACKAGING_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
-set(CPACK_PACKAGE_CONTACT "VPNCTL maintainers <https://github.com/sinedka/tunctl/issues>")
-set(CPACK_DEBIAN_PACKAGE_MAINTAINER "VPNCTL maintainers")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Terminal OpenVPN manager with policy routing")
-set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "systemd, openvpn (>= 2.6), iproute2, nftables (>= 1.0.7), curl (>= 8.9), iputils-ping, bind9-dnsutils, python3, python3-dnspython, libc-bin")
-set(CPACK_DEBIAN_PACKAGE_SUGGESTS "dnsmasq")
-include(CPack)

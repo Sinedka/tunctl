@@ -74,7 +74,7 @@ Json userRules() {
   }
   return Json::array();
 }
-void apply(const Json &rules, const Json &cfg) {
+void applyRules(const Json &rules, const Json &cfg) {
   require(rules.is_array() && rules.size() <= 256, "up to 256 rules allowed");
   auto owner = cfg.at("policyUser").get<std::string>();
   auto pw = getpwnam(owner.c_str());
@@ -266,7 +266,7 @@ Json handle(const Json &j, uid_t uid) {
     return data;
   }
   if (op == "refresh") {
-    apply(userRules(), cfg);
+    applyRules(userRules(), cfg);
     return {{"refreshed", true}};
   }
   if (op == "sync") {
@@ -275,10 +275,10 @@ Json handle(const Json &j, uid_t uid) {
     auto old = userRules();
     auto r = j.at("rules");
     try {
-      apply(r, cfg);
+      applyRules(r, cfg);
       write(state / "rules.json", Json{{"owner", user}, {"rules", r}}.dump());
     } catch (...) {
-      apply(old, cfg);
+      applyRules(old, cfg);
       throw;
     }
     return {{"applied", r.size()}};
@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
     fs::create_directories(profiles);
     if (refresh) {
       recoverSwitch();
-      apply(userRules(), policy());
+      applyRules(userRules(), policy());
     } else
       sendJson(0, handle(j, peer.uid));
     return 0;

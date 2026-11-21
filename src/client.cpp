@@ -17,6 +17,13 @@ namespace {
 volatile std::sig_atomic_t interrupted = 0;
 void interrupt(int) { interrupted = 1; }
 bool cliCancelled() { return interrupted != 0; }
+const fs::path &executable() {
+  static const auto path = fs::read_symlink("/proc/self/exe");
+  return path;
+}
+std::string importHelper() {
+  return (executable().parent_path() / VPNCTL_IMPORT_HELPER).lexically_normal();
+}
 fs::path xdg(const char *var, const char *fallback) {
   if (auto p = getenv(var); p && *p)
     return fs::path(p) / "vpnctl";
@@ -81,7 +88,7 @@ Args scope(std::string name, const Args &args) {
             "--quiet",
             "--slice=vpnctl-" + slice(name) + ".slice",
             "--",
-            "vpnctl",
+            executable(),
             "exec-ready"};
   a.insert(a.end(), args.begin(), args.end());
   return a;
@@ -510,7 +517,7 @@ int tui() {
           search = prompt("Filter: ");
         if (k == 'i') {
           auto p = prompt("Profile / directory / ZIP: ");
-          message = output({VPNCTL_IMPORT_HELPER, p}, 120, nullptr);
+          message = output({importHelper(), p}, 120, nullptr);
         }
         if (k == 'd')
           message = rpc({{"op", "disconnect"}}).dump();
@@ -550,7 +557,7 @@ int tui() {
               refresh();
               auto report =
                   output(scope("probe_direct",
-                               {"vpnctl", "measured", "endpoint",
+                               {executable(), "measured", "endpoint",
                                 p["endpoint"].get<std::string>(), "direct"}),
                          18, cancelled);
               Json h = Json::parse(report.substr(report.find('{')));
@@ -629,7 +636,7 @@ int tui() {
           line(LINES - 1, "Measuring... Esc cancels");
           refresh();
           if (directTest) {
-            Args inner = {"vpnctl", "measured", tests[k], target, "direct"};
+            Args inner = {executable(), "measured", tests[k], target, "direct"};
             if (confirmed)
               inner.push_back("--confirm");
             message = output(scope("probe_direct", inner), 23, cancelled);
@@ -694,9 +701,9 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (op == "validate" && a.size() == 2)
-      execute({VPNCTL_IMPORT_HELPER, a[1], "--validate"});
+      execute({importHelper(), a[1], "--validate", executable()});
     if (op == "import" && a.size() == 2)
-      execute({VPNCTL_IMPORT_HELPER, a[1]});
+      execute({importHelper(), a[1]});
     if (op == "diag" && a.size() >= 2) {
       bool confirm = a.back() == "--confirm";
       if (confirm)
@@ -713,7 +720,7 @@ int main(int argc, char **argv) {
     if (op == "diag" && a.size() >= 4 && a[1] == "endpoint")
       require(a[3] == "direct", "use direct for endpoint latency");
     if (op == "diag" && a.size() >= 4 && a[3] == "direct") {
-      Args inner = {"vpnctl", "measured"};
+      Args inner = {executable(), "measured"};
       inner.insert(inner.end(), a.begin() + 1, a.end());
       execute(scope("probe_direct", inner));
     }

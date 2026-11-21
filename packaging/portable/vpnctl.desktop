@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=VPNCTL
+Exec=vpnctl
+Icon=vpnctl
+Terminal=true
+Categories=Network;System;

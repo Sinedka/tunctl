@@ -1,0 +1,57 @@
+#!/bin/sh
+# Install only from a release trusted by the administrator.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 022
+root=$(dirname "$(readlink -f "$0")")
+base=/opt/vpnctl
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 0 ]; then
+    echo 'Usage (administrator): sudo ./install-backend' >&2
+    exit 1
+fi
+for tool in openvpn ip nft systemctl systemd-sysusers systemd-tmpfiles python3; do
+    command -v "$tool" >/dev/null || { echo "Missing dependency: $tool" >&2; exit 1; }
+done
+python3 -Ic 'import dns.query' || { echo 'Install python3-dnspython / python-dnspython' >&2; exit 1; }
+if [ -e /usr/lib/systemd/system/vpnctl.socket ]; then
+    echo 'Remove the packaged backend before installing a portable release.' >&2
+    exit 1
+fi
+
+# Preserve local overrides. Keep unit paths stable when systemctl resolves enablement links.
+install -d -m 0755 "$base/releases"
+exec 9>"$base/.install.lock"
+flock -x 9
+cd "$root"
+for file in lib/systemd/system/vpnctl* lib/sysusers.d/vpnctl.conf lib/tmpfiles.d/vpnctl.conf; do
+    dest=/etc/${file#lib/}
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        [ "$(readlink "$dest" || true)" = "$base/$file" ] || {
+            echo "Existing administrator file: $dest" >&2
+            exit 1
+        }
+    fi
+done
+release=$(mktemp -d "$base/releases/build.XXXXXXXX")
+chmod 0755 "$release"
+for dir in bin libexec share lib; do
+    cp -R --no-preserve=ownership "$dir" "$release/"
+done
+chmod -R go-w "$release"
+ln -s "$release" "$release/.current"
+mv -Tf "$release/.current" "$base/current"
+for file in lib/systemd/system/vpnctl* lib/sysusers.d/vpnctl.conf lib/tmpfiles.d/vpnctl.conf; do
+    install -Dm0644 "$file" "$base/$file"
+    dest=/etc/${file#lib/}
+    install -d -m 0755 "$(dirname "$dest")"
+    [ -L "$dest" ] || ln -s "$base/$file" "$dest"
+done
+install -d -m 0755 /etc/vpnctl
+if [ ! -e /etc/vpnctl/policy.json ]; then
+    install -m 0644 share/vpnctl/policy.example.json /etc/vpnctl/policy.json
+fi
+systemd-sysusers /etc/sysusers.d/vpnctl.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/vpnctl.conf
+systemctl daemon-reload
+echo "Backend installed. Configure /etc/vpnctl/policy.json before enabling the services."

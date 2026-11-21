@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run in a fresh, offline systemd container with the native package installed.
+# Run only in a fresh, offline systemd container. Accepts a portable release file.
 set -eu -o pipefail
 systemd-detect-virt --container --quiet
 [[ $(id -u) == 0 && $(ls /sys/class/net) == lo ]]
@@ -9,10 +9,31 @@ timeout 40 bash -c 'until systemctl show-environment >/dev/null 2>&1; do sleep 1
 # The offline fixture supplies its own uplink and does not use DHCP.
 systemctl mask --runtime systemd-networkd-wait-online.service
 systemctl start network-online.target
-systemd-sysusers /usr/lib/sysusers.d/vpnctl.conf
-systemd-tmpfiles --create /usr/lib/tmpfiles.d/vpnctl.conf
+if [[ $# == 1 ]]; then
+  archive=$(realpath "$1")
+  case "$archive" in
+    *.AppImage)
+      TMPDIR=/root "$archive" --appimage-extract-and-run --install-backend
+      client=(env TMPDIR=/home/tester "$archive" --appimage-extract-and-run)
+      ;;
+    *.tar.gz)
+      dest=$(mktemp -d /tmp/vpnctl-release.XXXXXXXX)
+      chmod 0755 "$dest"
+      tar -xzf "$archive" -C "$dest" --strip-components=1
+      "$dest/install-backend"
+      client=("$dest/vpnctl")
+      ;;
+    *) echo "Expected .AppImage or .tar.gz" >&2; exit 2 ;;
+  esac
+elif [[ $# == 0 ]]; then
+  client=(vpnctl)
+  systemd-sysusers /usr/lib/sysusers.d/vpnctl.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/vpnctl.conf
+  install -Dm644 /usr/share/vpnctl/policy.example.json /etc/vpnctl/policy.json
+else
+  exit 2
+fi
 useradd -m -G vpnctl tester
-install -Dm644 /usr/share/vpnctl/policy.example.json /etc/vpnctl/policy.json
 python3 - <<'PY'
 from pathlib import Path
 import json
@@ -21,7 +42,7 @@ cfg.update(operators=["tester"],policyUser="tester",killSwitch=True,directIPs=[]
 p.write_text(json.dumps(cfg))
 PY
 systemctl start vpnctl-routing.service vpnctl.socket
-runuser -u tester -- vpnctl status
+runuser -u tester -- "${client[@]}" status
 ip netns add peer
 ip link add uplink type veth peer name end
 ip link set end netns peer
@@ -54,8 +75,9 @@ nobind
 PROFILE
 chown -R tester: /home/tester/bundle
 cd /
-runuser -u tester -- vpnctl import /home/tester/bundle
-if ! runuser -u tester -- vpnctl connect peer; then
+runuser -u tester -- "${client[@]}" validate /home/tester/bundle
+runuser -u tester -- "${client[@]}" import /home/tester/bundle
+if ! runuser -u tester -- "${client[@]}" connect peer; then
   journalctl -u vpnctl-tunnel --no-pager -n 40
   tail -20 /tmp/server.log
   exit 1
@@ -70,5 +92,5 @@ for attempt in {1..10}; do
   sleep 1
 done
 [[ ${reply:-} == vpnctl-ok ]]
-runuser -u tester -- vpnctl disconnect
+runuser -u tester -- "${client[@]}" disconnect
 systemctl stop vpnctl.socket vpnctl-routing.service

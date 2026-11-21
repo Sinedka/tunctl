@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+root=$(dirname "$(readlink -f "$0")")
+if [ "${1:-}" = --install-backend ]; then
+    shift
+    exec "$root/install-backend" "$@"
+fi
+exec "$root/bin/vpnctl" "$@"

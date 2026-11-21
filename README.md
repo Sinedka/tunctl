@@ -2,42 +2,82 @@
 
 Терминальный менеджер OpenVPN для Linux с systemd. Пользователь выбирает профиль и правила в TUI. Системный сервис проверяет запрос и управляет туннелем, nftables и policy routing. Поддерживаются IPv4, IPv6, исключения для адресов, DNS-имён и пользовательских cgroups v2.
 
-## Выберите дистрибутив
+## Установка через Nix flake
 
-| Система | Установка |
-|---|---|
-| Arch Linux | Пакет через `makepkg` и `pacman -U` |
-| Debian 13 | Пакет `.deb` через CMake/CPack и `apt install ./…deb` |
-| Другие дистрибутивы с systemd | CMake с установкой системных служб |
-| NixOS | Flake, NixOS module и Home Manager |
+Добавьте VPNCTL в `inputs` **вашей конфигурации**. Nix получит проект с GitHub. Если Home Manager уже подключён, оба `follows` используют версии из вашего lock-файла.
 
-Сборка нативных пакетов, права оператора и первый запуск описаны в [инструкции для Linux](docs/linux.md).
-
-## Установка на NixOS
-
-В каталоге проекта выполните:
-
-```sh
-nix build
-nix flake check
-nix run . -- --help
-nix develop
+```nix
+inputs.vpnctl = {
+  url = "github:sinedka/tunctl";
+  inputs.nixpkgs.follows = "nixpkgs";
+  inputs.home-manager.follows = "home-manager";
+};
 ```
 
-Для установки клиента в свой профиль используйте `nix profile install .#vpnctl`. Для подключения VPN нужен также системный модуль. Добавьте в flake **конфигурации машины** input `vpnctl.url = "github:sinedka/tunctl";` и включите `vpnctl.nixosModules.default` в список `modules`. Для запуска клиента прямо из GitHub выполните `nix run github:sinedka/tunctl`. Ссылка вида `path:/...` на рабочую директорию с архивами или ключами может скопировать их в Nix Store.
+Без Home Manager опустите строку `inputs.home-manager.follows`. В примерах ниже `inputs` доступен внутри `outputs = inputs@{ nixpkgs, ... }: ...`.
 
-Включите параметры из [examples/nixos.nix](examples/nixos.nix). Замените `alice` именем доверенного оператора. При включённом kill switch обычный трафик блокируется сразу после активации модуля, в том числе до первого подключения. Первую активацию удобно проводить с локальной консоли. При использовании resolved ознакомьтесь с разделом DNS ниже.
+### NixOS — клиент и системный сервис
 
-Для Home Manager добавьте `vpnctl.homeManagerModules.default` в пользовательские `imports` и подключите [examples/home.nix](examples/home.nix). Полный пример объединения модулей приведён в [examples/flake.nix](examples/flake.nix). Он предполагает существующие `configuration.nix`, пользователя и настройки `home.stateVersion`.
+Добавьте эти элементы в `nixosConfigurations.<имя>.modules`. Замените `alice` именем существующего пользователя. Модуль установит команду `vpnctl`, создаст сокет и предоставит оператору доступ к backend.
 
-```sh
-sudo nixos-rebuild switch --flake /etc/nixos#myhost
-# После нового входа пользователя в сессию
-vpnctl status
-vpnctl
+```nix
+modules = [
+  # ... ваши модули
+  inputs.vpnctl.nixosModules.default
+  {
+    services.vpnctl = {
+      enable = true;
+      operators = [ "alice" ];
+      policyUser = "alice";
+      routing.killSwitch = false;
+    };
+  }
+];
 ```
 
-Здесь `myhost` — имя записи в `nixosConfigurations`. При отдельной установке Home Manager примените также `home-manager switch --flake /путь/к/home-flake#alice`. Команда `nix run .` открывает TUI от обычного пользователя.
+Выполните из каталога вашей конфигурации, подставив имя хоста:
+
+```sh
+sudo nixos-rebuild switch --flake .#myhost
+```
+
+Войдите в сессию заново для получения группы `vpnctl`, затем запустите `vpnctl status` или `vpnctl`. В этом примере kill switch выключен для первого запуска. Значение `true` блокирует обычный трафик даже до подключения VPN.
+
+### Home Manager — настройки пользователя
+
+В список модулей Home Manager добавьте `inputs.vpnctl.homeModules.default`, а в `home.nix` включите `programs.vpnctl.enable = true;`. Для импортирования прямо из `home.nix` передайте `inputs` через `extraSpecialArgs`:
+
+```nix
+{ inputs, ... }: {
+  imports = [ inputs.vpnctl.homeModules.default ];
+  programs.vpnctl.enable = true;
+}
+```
+
+Для отдельного Home Manager примените `home-manager switch --flake .#alice`. При интеграции в NixOS достаточно `nixos-rebuild switch`. Если ваш lock-файл закрепляет ревизию до появления `homeModules`, используйте `inputs.vpnctl.homeManagerModules.default` — это имя также поддерживается в новых ревизиях. Полный пример с обоими модулями и варианты настройки правил приведены в [examples/flake.nix](examples/flake.nix) и [examples/home.nix](examples/home.nix).
+
+### Только пакет или разовый запуск
+
+В модуле, получающем `inputs` и `pkgs`, используйте пакет напрямую:
+
+```nix
+environment.systemPackages = [
+  inputs.vpnctl.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+```
+
+В Home Manager тот же пакет можно добавить в `home.packages`. Для разового запуска выполните `nix run github:sinedka/tunctl`. Для постоянной установки клиента в профиль — `nix profile add github:sinedka/tunctl`. Управление VPN требует включённого системного сервиса. Чтобы обновить закреплённую версию во flake конфигурации, выполните `nix flake update vpnctl` и пересоберите конфигурацию.
+
+## Arch Linux, Debian и другие дистрибутивы
+
+Выберите **AppImage** или **tar.gz с готовыми бинарниками**. Оба варианта включают клиент, backend и systemd units. На x86_64 клиент запускается так:
+
+```sh
+chmod +x vpnctl-0.1.0-x86_64.AppImage
+./vpnctl-0.1.0-x86_64.AppImage
+```
+
+Для управления сетью администратор один раз устанавливает backend из того же файла и добавляет пользователя в список операторов. Команды для обоих форматов, зависимости и порядок удаления приведены в [руководстве для Linux](docs/linux.md).
 
 ## Профили
 

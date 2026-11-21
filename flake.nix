@@ -35,7 +35,8 @@
         default = nixpkgs.legacyPackages.${system}.mkShell { inputsFrom = [ (package system) ]; };
       });
       nixosModules.default = inject ./nix/modules/nixos/vpnctl.nix;
-      homeManagerModules.default = inject ./nix/modules/home-manager/vpnctl.nix;
+      homeModules.default = inject ./nix/modules/home-manager/vpnctl.nix;
+      homeManagerModules = self.homeModules;
       checks = each (
         system:
         let
@@ -48,7 +49,7 @@
             (home-manager.lib.homeManagerConfiguration {
               inherit pkgs;
               modules = [
-                self.homeManagerModules.default
+                self.homeModules.default
                 {
                   home.username = "tester";
                   home.homeDirectory = "/home/tester";

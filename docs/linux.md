@@ -1,61 +1,62 @@
 # VPNCTL на Linux с systemd
 
-На Debian и Arch используйте обычные системные пакеты. Устанавливаются TUI, привилегированный backend, OpenVPN unit, фильтр исходящего трафика, таймер обновления правил и DNS upstream. Команды сборки ниже выполняются в корне checkout VPNCTL.
+## Запуск клиента
 
-## Debian 13
+Готовые файлы для x86_64 рассчитаны на Linux с glibc 2.36 и новее. Nix, компилятор и отдельный пакет VPNCTL не нужны. Выберите один формат.
 
-```sh
-sudo apt update
-sudo apt install build-essential cmake dpkg-dev file libssl-dev libncurses-dev nlohmann-json3-dev openssl python3
-cmake -S . -B build/debian -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build build/debian --parallel
-ctest --test-dir build/debian --output-on-failure
-(cd build/debian && cpack -G DEB)
-sudo apt install ./build/debian/vpnctl_*.deb
-```
-
-APT установит зависимости из репозиториев Debian. Если нужен локальный DNS-маршрутизатор, отдельно установите пакет `dnsmasq`.
-
-## Arch Linux
-
-Соберите пакет из текущего рабочего дерева. В архив попадают только перечисленные ниже файлы проекта под контролем Git. Запускайте `makepkg` от обычного пользователя.
+**AppImage**
 
 ```sh
-sudo pacman -S --needed base-devel git
-mkdir -p build/arch
-cp packaging/arch/PKGBUILD build/arch/
-git ls-files -z -- CMakeLists.txt LICENSE include src packaging tests |
-  tar --null --transform='s,^,vpnctl-0.1.0/,' -czf build/arch/vpnctl-0.1.0.tar.gz -T -
-(cd build/arch && makepkg --syncdeps --install)
+chmod +x vpnctl-0.1.0-x86_64.AppImage
+./vpnctl-0.1.0-x86_64.AppImage
 ```
 
-При установке готового пакета используйте `sudo pacman -U ./vpnctl-0.1.0-1-*.pkg.tar.zst`. Для локального DNS установите `dnsmasq`.
+Обычный запуск использует FUSE и утилиту `fusermount3` (пакет `fuse3`). Если FUSE недоступен, используйте `TMPDIR="${XDG_RUNTIME_DIR:-$HOME}" ./vpnctl-0.1.0-x86_64.AppImage --appimage-extract-and-run`.
 
-## Другие дистрибутивы
-
-Нужны Linux с TUN, cgroup v2 и nftables socket cgroupv2, системный и пользовательский systemd, OpenVPN 2.6+ с systemd notify, nft с командой `destroy`, iproute2, Python 3 с dnspython, curl 8.9+ и утилиты ping, dig, getent. Для сборки нужны компилятор C++23, CMake 3.20+, заголовки OpenSSL, ncurses и nlohmann/json. Версия curl важна для привязки теста к конкретному интерфейсу. Проверены форматы упаковки, описанные выше. Для другого дистрибутива сопоставьте названия зависимостей с его пакетами.
+**Архив с бинарником**
 
 ```sh
-cmake -S . -B build/linux -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build build/linux --parallel
-ctest --test-dir build/linux --output-on-failure
-sudo cmake --install build/linux
+tar -xzf vpnctl-0.1.0-x86_64.tar.gz
+cd vpnctl-0.1.0-x86_64
+./vpnctl
 ```
 
-## Первый запуск
+Архив можно распаковать в домашний каталог. Перемещайте каталог целиком, чтобы рядом с бинарником оставались библиотеки и импортёр профилей. После установки backend на том же компьютере любая копия клиента может обращаться к его сокету.
 
-1. Создайте системную группу и рабочие каталоги. На новой установке скопируйте образец политики.
+## Первый запуск VPN
+
+1. Администратору нужны systemd, cgroups v2, TUN, OpenVPN 2.6+, nftables с поддержкой `destroy`, iproute2 и Python 3 с dnspython. Для диагностики нужны curl 8.9+, ping, dig и getent. На Arch зависимости устанавливаются следующей командой.
 
    ```sh
-   sudo systemd-sysusers /usr/lib/sysusers.d/vpnctl.conf
-   sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/vpnctl.conf
-   sudo install -d -m 0755 /etc/vpnctl
-   sudo cp --no-clobber /usr/share/vpnctl/policy.example.json /etc/vpnctl/policy.json
+   sudo pacman -S --needed openvpn nftables iproute2 python python-dnspython curl iputils bind
+   ```
+
+   На Debian 13:
+
+   ```sh
+   sudo apt install openvpn nftables iproute2 python3-dnspython curl iputils-ping bind9-dnsutils
+   ```
+
+2. Установите backend **одним** из способов. Используйте файл сборки, которому доверяет администратор. Для AppImage:
+
+   ```sh
+   sudo env TMPDIR=/root ./vpnctl-0.1.0-x86_64.AppImage --appimage-extract-and-run --install-backend
+   ```
+
+   Из распакованного tar:
+
+   ```sh
+   sudo ./install-backend
+   ```
+
+   Установщик размещает исполняемые файлы в `/opt/vpnctl`, регистрирует службы systemd и создаёт начальную политику. Он сохраняет существующую политику при обновлении. Укажите имя пользователя в массиве `operators`. Чтобы разрешить этому пользователю менять правила для всего хоста и запускать DIRECT-тесты, укажите его имя и в `policyUser`.
+
+   ```sh
    sudo usermod -aG vpnctl "$(id -un)"
    sudoedit /etc/vpnctl/policy.json
    ```
 
-2. Впишите имя своей учётной записи в массив `operators`. Чтобы разрешить ей менять правила для всего хоста и запускать DIRECT-тесты, укажите то же имя в `policyUser`. Образец начинает с пустого списка операторов и `killSwitch: false`. Значение `true` блокирует обычный исходящий трафик сразу после включения службы, включая время до первого подключения.
+   По умолчанию kill switch выключен. Значение `"killSwitch": true` блокирует обычный трафик с момента включения службы, включая время до первого подключения.
 
 3. Для VPNCTL зарезервированы устройство `vpnctl0`, приоритет и таблица маршрутов 30201 и таблицы nftables `inet vpnctl` и `inet vpnctl_session`. Убедитесь, что системный firewall при обновлении сохраняет чужие таблицы. Глобальный `flush ruleset` удаляет также защиту VPNCTL. Включите маршрутизацию и сокет после проверки конфигурации.
 
@@ -67,10 +68,12 @@ sudo cmake --install build/linux
 4. После нового входа в пользовательскую сессию импортируйте профиль и выберите сервер в TUI.
 
    ```sh
-   vpnctl status
-   vpnctl import ~/Downloads/server.ovpn
-   vpnctl
+   /opt/vpnctl/current/bin/vpnctl status
+   /opt/vpnctl/current/bin/vpnctl import ~/Downloads/server.ovpn
+   /opt/vpnctl/current/bin/vpnctl
    ```
+
+Для вызова команды по имени добавьте `/opt/vpnctl/current/bin` в пользовательский `PATH`.
 
 Для автоподключения последнего выбранного профиля выполните `sudo systemctl enable vpnctl-tunnel.service`. После изменения системного списка IP или kill switch используйте `sudo systemctl reload vpnctl-routing.service`. Вкладка Routing позволяет управлять пользовательскими исключениями. Для маршрутизации приложения добавьте его там и запустите, например, `vpnctl launch firefox firefox`. Для запуска из графического меню используйте ту же команду в пользовательском desktop entry.
 
@@ -105,4 +108,35 @@ sudo systemctl stop vpnctl-session.service vpnctl-refresh.service
 sudo systemctl disable --now vpnctl-routing.service
 ```
 
-Удалите пакет через `sudo apt remove vpnctl` или `sudo pacman -R vpnctl`. Профили и ключи сохраняются в `/var/lib/vpnctl`. Если устанавливали напрямую через CMake, список установленных файлов находится в `build/linux/install_manifest.txt`.
+Удалите ссылки установщика и выбранную сборку после остановки служб. Каталог `/opt/vpnctl` содержит установленные этим способом версии. Системная политика хранится в `/etc/vpnctl`, профили и ключи — в `/var/lib/vpnctl`.
+
+```sh
+sudo find /etc/systemd/system /etc/tmpfiles.d /etc/sysusers.d -maxdepth 1 \
+  -type l -lname '/opt/vpnctl/lib/*' -delete
+sudo rm -r /opt/vpnctl
+sudo systemctl daemon-reload
+```
+
+## Сборка обоих файлов из исходников
+
+В Debian 12 установите зависимости сборки:
+
+```sh
+sudo apt install g++ cmake make nlohmann-json3-dev libssl-dev libncurses-dev \
+  patchelf squashfs-tools python3 openssl curl
+```
+
+В корне проекта скачайте закреплённый runtime для архитектуры сборочной машины. Скрипт сверяет его SHA-256 перед упаковкой. Затем CMake собирает клиент и backend, CTest выполняет проверки, а скрипт записывает оба готовых файла в `build/portable`.
+
+```sh
+case "$(uname -m)" in
+  x86_64) asset=657374641 ;;
+  aarch64) asset=657373827 ;;
+  *) exit 1 ;;
+esac
+mkdir -p build/portable
+curl -fL -H 'Accept: application/octet-stream' \
+  "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/$asset" \
+  -o build/portable/runtime
+packaging/portable/build.sh build/portable/runtime build/portable
+```

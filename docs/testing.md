@@ -18,18 +18,22 @@
 | Home Manager | Собирается конфигурация с IP, доменным и прикладным правилами, desktop entry и build-time проверкой JSON. VM отдельно проверяет отправку правил backend. Вход в графическую сессию, пользовательские темы, сброс и экспорт overrides остаются ручными сценариями. |
 | Boot и удаление | VM проверяет запуск socket и routing при загрузке. Автоподключение сохранённого профиля при повторной загрузке, откат поколения и удаление на существующем хосте требуют отдельной проверки. |
 
-## Нативные пакеты Linux
+## Переносимые файлы для Linux
 
-На Debian 13 и Arch Linux x86_64 проверены сборка пакета, установка через APT или pacman, CTest и загрузка systemd units. Сквозной сценарий поднимает OpenVPN-сервер в отдельном network namespace, включает kill switch и импортирует профиль с внешними сертификатами. Оператор подключается через Unix-сокет. Затем обычный пользователь получает по HTTP через TUN контрольную строку и отключает VPN. Используются OpenVPN 2.6.14 на Debian и 2.7.9 на Arch.
+Сборка в Debian 12 x86_64 запускает три теста CTest и проверяет запуск упакованного AppImage. Сквозной сценарий устанавливает backend из указанного файла в пустой контейнер с systemd, включает kill switch, валидирует и импортирует профиль с внешними сертификатами от имени оператора. После TLS handshake тест проверяет HTTP-ответ по TUN и отключает VPN.
 
-Для повторения нужен локальный образ с установленным пакетом VPNCTL, его зависимостями, systemd, bash, openssl и util-linux. Команды ниже запускаются из корня проекта. Подставьте имя своего образа в `image`.
+Для версии 0.1.0 этот сценарий прошёл с AppImage на Debian 13 и с tar.gz на Arch Linux. На обеих системах проверен обычный запуск AppImage через FUSE 3, на Arch также проверены открытие TUI и ввод клавиш в псевдотерминале. Повторная установка переносимой версии в Debian сохранила политику и включённые службы. Готовые артефакты проверены на x86_64.
+
+Для воспроизведения подготовьте локальный образ Debian 13 или Arch с systemd и зависимостями backend из [руководства для Linux](linux.md), bash, openssl и util-linux. Команды выполняются из корня проекта. Для прогона архива подставьте имя `.tar.gz` в `release`. Каждый тест использует новый контейнер.
 
 ```sh
 image=localhost/vpnctl-test
+release=vpnctl-0.1.0-x86_64.AppImage
 podman run -d --name vpnctl-native-test --systemd=always --network=none \
   --device=/dev/net/tun --cap-add=NET_ADMIN --cap-add=SYS_ADMIN \
-  -v "$PWD/tests/native_tunnel.sh:/native-test:ro" "$image" /usr/lib/systemd/systemd
-podman exec vpnctl-native-test bash /native-test
+  -v "$PWD/tests/native_tunnel.sh:/native-test:ro" \
+  -v "$PWD/build/portable:/files:ro" "$image" /usr/lib/systemd/systemd
+podman exec vpnctl-native-test bash /native-test "/files/$release"
 podman rm -f vpnctl-native-test
 ```
 
