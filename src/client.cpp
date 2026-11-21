@@ -7,11 +7,13 @@
 #include <cstring>
 #include <ctime>
 #include <curses.h>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <unistd.h>
 
 using namespace vpn;
@@ -292,6 +294,8 @@ int tui() {
   Json history = load(historyPath, Json::object());
 
   Json status;
+  std::future<Json> connection;
+  std::string logText;
   std::string tabs[] = {"Dashboard",   "Servers",  "Routing",
                         "Diagnostics", "Settings", "Logs"};
   unsigned long long prevRx = 0, prevTx = 0;
@@ -299,9 +303,22 @@ int tui() {
   auto last = std::chrono::steady_clock::now();
   while (true) {
     try {
-      status = rpc({{"op", "status"}});
+      if (connection.valid() && connection.wait_for(std::chrono::seconds(0)) ==
+                                    std::future_status::ready) {
+        try {
+          message = connection.get().dump();
+        } catch (const std::exception &e) {
+          message = e.what();
+        }
+      }
+      if (page == 5)
+        logText = rpc({{"op", "logs"}}).at("events").get<std::string>();
+      else
+        status = rpc({{"op", "status"}});
     } catch (const std::exception &e) {
       status = {{"state", "unavailable"}, {"lastError", e.what()}};
+      if (page == 5)
+        logText = e.what();
     }
     auto current =
         status.value("selected", "") + " " + status.value("state", "");
@@ -315,8 +332,9 @@ int tui() {
     }
     erase();
     attron(COLOR_PAIR(1) | A_BOLD);
-    line(0, "VPNCTL    " + status.value("state", "unknown") + "    " +
-                status.value("selected", ""));
+    line(0, page == 5 ? "VPNCTL    Logs"
+                      : "VPNCTL    " + status.value("state", "unknown") +
+                            "    " + status.value("selected", ""));
     attroff(COLOR_PAIR(1) | A_BOLD);
     std::string nav;
     for (int i = 0; i < 6; i++)
@@ -473,24 +491,47 @@ int tui() {
              "quit";
     }
     if (page == 5) {
-      line(4, "Connection events");
-      std::istringstream events(status.value("events", ""));
-      int y = 6;
-      for (std::string e; std::getline(events, e) && y < LINES - 2;)
-        line(y++, e);
+      std::vector<std::string> entries;
+      std::istringstream events(logText);
+      for (std::string row; std::getline(events, row);) {
+        // Wrap the message so narrow terminals can still show the failure
+        // reason.
+        const size_t width = std::max(1, COLS - 2);
+        for (size_t pos = 0; pos < row.size(); pos += width)
+          entries.push_back(row.substr(pos, width));
+      }
+      int height = std::max(1, LINES - 6);
+      scroll = std::clamp(scroll, 0, std::max(0, int(entries.size()) - height));
+      line(3,
+           message.empty() ? "Connection events (UTC, newest first)" : message);
+      for (int i = 0; i < height && scroll + i < int(entries.size()); ++i)
+        line(5 + i, entries[scroll + i]);
+      help = "Up/Down or PgUp/PgDn scroll   Home latest   q quit";
+    } else {
+      int y = std::max(5, LINES - 7);
+      std::istringstream msg(message);
+      for (std::string l; std::getline(msg, l) && y < LINES - 2;)
+        line(y++, l);
     }
-    int y = std::max(5, LINES - 7);
-    std::istringstream msg(message);
-    for (std::string l; std::getline(msg, l) && y < LINES - 2;)
-      line(y++, l);
     line(LINES - 1, help);
     refresh();
-    timeout(interval * 1000);
+    timeout(page == 5 ? 1000 : interval * 1000);
     int k = getch();
     if (k == 'q')
       return 0;
+    if (page == 5) {
+      if (k == KEY_UP || k == KEY_DOWN)
+        scroll += k == KEY_UP ? -1 : 1;
+      if (k == KEY_PPAGE || k == KEY_NPAGE)
+        scroll += (k == KEY_PPAGE ? -1 : 1) * std::max(1, LINES - 6);
+      if (k == KEY_HOME)
+        scroll = 0;
+      if (connection.valid())
+        continue;
+    }
     if (k >= '1' && k <= '6') {
       page = k - '1';
+      scroll = 0;
       idx = 0;
       message.clear();
 
@@ -542,10 +583,19 @@ int tui() {
                            {"name", n},
                            {"country", prompt("Country (name or ISO code): ")}})
                           .dump();
-          if (k == '\n' || (k == 'x' && prompt("Type DELETE: ") == "DELETE"))
-            message =
-                rpc({{"op", k == 'x' ? "remove" : "connect"}, {"name", n}})
-                    .dump();
+          if (k == '\n') {
+            // Exiting the viewer does not cancel the daemon's transaction.
+            std::packaged_task<Json()> request(
+                [n] { return rpc({{"op", "connect"}, {"name", n}}); });
+            connection = request.get_future();
+            std::thread(std::move(request)).detach();
+            page = 5;
+            scroll = 0;
+            status["state"] = "connecting";
+            message = "Connecting " + n.get<std::string>();
+          }
+          if (k == 'x' && prompt("Type DELETE: ") == "DELETE")
+            message = rpc({{"op", "remove"}, {"name", n}}).dump();
           if (k == ' ') {
             auto name = n.get<std::string>();
             if (!marked.erase(name))
@@ -693,10 +743,11 @@ int main(int argc, char **argv) {
     }
     auto op = a[0];
     if (op == "--help" || op == "help") {
-      std::cout << "vpnctl [status|connect NAME|disconnect|remove NAME|import "
-                   "[PATH]|validate [PATH]|check-settings "
-                   "[PATH]|sync|reset|export|launch APP COMMAND...|diag TEST "
-                   "TARGET vpn|direct [--confirm]]\n";
+      std::cout
+          << "vpnctl [status|logs|connect NAME|disconnect|remove NAME|import "
+             "[PATH]|validate [PATH]|check-settings "
+             "[PATH]|sync|reset|export|launch APP COMMAND...|diag TEST "
+             "TARGET vpn|direct [--confirm]]\n";
       return 0;
     }
     if (op == "exec-ready" && a.size() >= 2) {
@@ -768,6 +819,10 @@ int main(int argc, char **argv) {
       std::cout << diag(a[1], a[2], a[3], a.size() == 5 && a[4] == "--confirm",
                         cliCancelled)
                 << "\n";
+      return 0;
+    }
+    if (op == "logs" && a.size() == 1) {
+      std::cout << rpc({{"op", "logs"}}).at("events").get<std::string>();
       return 0;
     }
     if (op == "export") {

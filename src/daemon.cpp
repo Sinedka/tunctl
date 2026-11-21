@@ -5,10 +5,12 @@
 #include <iostream>
 #include <net/if.h>
 #include <pwd.h>
+#include <sstream>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <syslog.h>
 #include <thread>
 #include <unistd.h>
 
@@ -35,12 +37,12 @@ void selectProfile(const std::string &n) {
 bool ctl(const char *op) {
   return run({"systemctl", op, unit}, 48).status == 0;
 }
-bool initialized() {
-  if (!if_nametoindex("vpnctl0"))
-    return false;
+// Only fixed state names are exposed: management detail fields can contain peer
+// data.
+std::string managementState() {
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
-    return false;
+    return "WAIT_MANAGEMENT";
   timeval t{1, 0};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
   sockaddr_un a{AF_UNIX, "/run/vpnctl-tunnel/management"};
@@ -56,9 +58,56 @@ bool initialized() {
     }
   }
   close(fd);
-  return reply.contains(",CONNECTED,SUCCESS,");
+  std::istringstream stream(reply);
+  for (std::string row; std::getline(stream, row);) {
+    auto first = row.find(',');
+    if (first == 0 || first == row.npos ||
+        row.find_first_not_of("0123456789") != first)
+      continue;
+    auto next = row.find(',', first + 1);
+    if (next == row.npos)
+      continue;
+    auto name = row.substr(first + 1, next - first - 1);
+    if (name == "CONNECTED" && row.compare(next, 9, ",SUCCESS,") == 0)
+      return name;
+    for (auto known : {"INITIAL", "CONNECTING", "RESOLVE", "TCP_CONNECT",
+                       "WAIT", "AUTH", "AUTH_PENDING", "GET_CONFIG",
+                       "ASSIGN_IP", "ADD_ROUTES", "RECONNECTING", "EXITING"})
+      if (name == known)
+        return name;
+  }
+  return "WAIT_MANAGEMENT";
+}
+bool initialized() {
+  return if_nametoindex("vpnctl0") && managementState() == "CONNECTED";
+}
+void logEvent(const std::string &text, int level = LOG_INFO) {
+  syslog(level, "%s", text.c_str());
+}
+std::string connectionLog() {
+  auto r = run({"journalctl", "--no-pager", "--quiet", "--utc", "--no-hostname",
+                "-o", "short-iso", "-r", "-n", "160", "_UID=0",
+                "SYSLOG_IDENTIFIER=vpnctl-events"},
+               4);
+  if (r.status == 0 && !r.output.empty()) {
+    std::istringstream in(r.output);
+    std::string out;
+    for (std::string row; std::getline(in, row);) {
+      auto stamp = row.find(' '), tag = row.find(": ", stamp);
+      if (stamp != row.npos && tag != row.npos)
+        out += row.substr(0, stamp) + "  " + row.substr(tag + 2) + "\n";
+    }
+    if (!out.empty())
+      return out;
+  }
+  auto legacy = state / "events";
+  auto history = fs::exists(legacy) ? read(legacy) : std::string{};
+  return r.status == 0
+             ? history
+             : "System journal unavailable. Recent actions:\n" + history;
 }
 void event(const std::string &text) {
+  logEvent(text);
   auto p = state / "events";
   std::string events = fs::exists(p) ? read(p) : "";
   events = std::to_string(time(nullptr)) + "  " + text + "\n" + events;
@@ -148,6 +197,7 @@ void recoverSwitch() {
   if (!fs::exists(transaction))
     return;
   bool restore = read(transaction) == "yes";
+  logEvent("Recovery: interrupted profile switch detected", LOG_WARNING);
   require(ctl("stop"), "cannot stop interrupted switch");
   fs::remove(pending);
   if (restore && !selected().empty())
@@ -158,8 +208,7 @@ void recoverSwitch() {
   fs::remove(transaction);
   event("recovered interrupted profile switch");
 }
-Json handle(const Json &j, uid_t uid) {
-  auto cfg = policy();
+std::string operatorName(uid_t uid, const Json &cfg) {
   auto *pw = getpwuid(uid);
   require(pw != nullptr, "unknown peer");
   std::string user = pw->pw_name;
@@ -167,6 +216,11 @@ Json handle(const Json &j, uid_t uid) {
               std::find(cfg.at("operators").begin(), cfg.at("operators").end(),
                         user) != cfg.at("operators").end(),
           "unauthorized peer");
+  return user;
+}
+Json handle(const Json &j, uid_t uid) {
+  auto cfg = policy();
+  auto user = operatorName(uid, cfg);
   auto op = j.at("op").get<std::string>();
   if (op == "inspect") {
     std::string section = j.at("section");
@@ -280,17 +334,20 @@ Json handle(const Json &j, uid_t uid) {
       applyRules(r, cfg);
       write(state / "rules.json", Json{{"owner", user}, {"rules", r}}.dump());
     } catch (...) {
+      logEvent("Routing: update failed; restoring previous rules", LOG_WARNING);
       applyRules(old, cfg);
       throw;
     }
+    event("Routing: applied " + std::to_string(r.size()) + " user rules");
     return {{"applied", r.size()}};
   }
   if (op == "disconnect") {
+    logEvent("Disconnect: stopping OpenVPN");
     require(ctl("stop"), "stop failed");
     fs::remove(pending);
     fs::remove(transaction);
     releaseGuard();
-    event("disconnected");
+    event("Disconnect: tunnel stopped and session guard released");
     return {{"disconnected", true}};
   }
   std::string n = j.at("name");
@@ -336,6 +393,7 @@ Json handle(const Json &j, uid_t uid) {
     }
     fs::remove(path);
     fs::remove(path.string() + ".json");
+    event("Profile: removed " + n);
     return {{"removed", n}};
   }
   require(op == "connect", "unknown operation");
@@ -343,29 +401,43 @@ Json handle(const Json &j, uid_t uid) {
   bool restore =
       !selected().empty() &&
       run({"systemctl", "is-active", "vpnctl-session.service"}).status == 0;
+  event("Connect: requested profile " + n);
+  if (restore)
+    logEvent("Switch: previous profile " + selected() +
+             " available for rollback");
   write(transaction, restore ? "yes" : "no");
+  logEvent("Connect: stopping previous tunnel instance");
   require(ctl("stop"), "cannot stop tunnel");
 
   fs::remove(pending);
   fs::create_symlink(path, pending);
-  if (ctl("start") && initialized()) {
+  logEvent("Connect: starting OpenVPN for " + n);
+  bool started = ctl("start");
+  if (started && initialized()) {
     selectProfile(n);
     fs::remove(transaction);
     fs::remove(pending);
     fs::remove(state / "last-error");
-    event("connected " + n);
+    event("Connect: profile " + n + " is active on vpnctl0");
     return {{"connected", n}};
   }
+  logEvent(started
+               ? "Connect: OpenVPN unit started but tunnel readiness was lost"
+               : "Connect: systemd could not start the OpenVPN unit",
+           LOG_ERR);
   require(ctl("stop"), "candidate could not be stopped");
   fs::remove(pending);
-  std::string message = "OpenVPN initialization failed; see journalctl -b -u "
-                        "vpnctl-tunnel.service";
-  if (restore)
+  std::string message = "OpenVPN initialization failed for " + n +
+                        "; see Logs (6) or vpnctl logs";
+  if (restore) {
+    logEvent("Rollback: restarting previous profile " + selected());
     message += (ctl("start") && initialized())
                    ? "; previous tunnel restored"
                    : "; previous tunnel also failed";
-  else
+  } else {
     releaseGuard();
+    logEvent("Connect: failed candidate stopped and session guard released");
+  }
   fs::remove(transaction);
   event(message);
   write(state / "last-error", message);
@@ -374,16 +446,70 @@ Json handle(const Json &j, uid_t uid) {
 } // namespace
 int main(int argc, char **argv) {
   umask(0077);
+  openlog("vpnctl-events", LOG_PID, LOG_DAEMON);
+  if (argc == 2 && std::string_view(argv[1]) == "routes-ready") {
+    logEvent("Routing: tunnel routes installed in table 30201");
+    return 0;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "tunnel-stopped") {
+    // The invocation filter excludes previous attempts. Never forward raw
+    // provider messages, certificate subjects, or authentication fields.
+    std::string invocation =
+        getenv("INVOCATION_ID") ? getenv("INVOCATION_ID") : "";
+    if (invocation.size() == 32 &&
+        invocation.find_first_not_of("0123456789abcdef") == invocation.npos) {
+      auto journal =
+          run({"journalctl", "--no-pager", "--quiet", "-o", "cat", "-n", "80",
+               "_SYSTEMD_INVOCATION_ID=" + invocation, "_COMM=openvpn"},
+              2);
+      for (auto [marker, reason] :
+           {std::pair{"AUTH_FAILED", "server rejected authentication"},
+            {"VERIFY ERROR", "server certificate verification failed"},
+            {"failed to negotiate cipher", "no shared data cipher"},
+            {"TLS key negotiation failed", "TLS negotiation timed out"},
+            {"TLS handshake failed", "TLS handshake failed"},
+            {"Network is unreachable", "network unreachable"},
+            {"Connection refused", "transport connection refused"}}) {
+        if (journal.status == 0 && journal.output.contains(marker)) {
+          logEvent(std::string("OpenVPN: ") + reason, LOG_ERR);
+          break;
+        }
+      }
+    }
+    auto raw = getenv("SERVICE_RESULT");
+    std::string result = "unknown";
+    for (auto known : {"success", "exit-code", "signal", "core-dump", "timeout",
+                       "resources", "protocol", "watchdog", "oom-kill"})
+      if (raw && std::string_view(raw) == known)
+        result = known;
+    logEvent("OpenVPN: service stopped (" + result + ")",
+             result == "success" ? LOG_INFO : LOG_WARNING);
+    return 0;
+  }
   // systemctl start is called while the IPC handler holds the transaction lock.
   // ExecStartPost must observe OpenVPN directly, without acquiring that lock.
   if (argc == 2 && std::string_view(argv[1]) == "wait-ready") {
     using namespace std::chrono_literals;
     auto deadline = std::chrono::steady_clock::now() + 32s;
+    auto start = std::chrono::steady_clock::now();
+    std::string previous;
+    logEvent("OpenVPN: waiting for handshake and vpnctl0");
     do {
-      if (initialized())
+      auto stage = managementState();
+      if (stage != previous) {
+        logEvent("OpenVPN state: " + stage);
+        previous = stage;
+      }
+      if (stage == "CONNECTED" && if_nametoindex("vpnctl0")) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        logEvent("OpenVPN: handshake confirmed, vpnctl0 present (" +
+                 std::to_string(ms.count()) + " ms since readiness check)");
         return 0;
+      }
       std::this_thread::sleep_for(100ms);
     } while (std::chrono::steady_clock::now() < deadline);
+    logEvent("OpenVPN: readiness timed out; last state " + previous, LOG_ERR);
     std::cerr
         << "Timed out waiting for vpnctl0 and OpenVPN CONNECTED,SUCCESS\n";
     return 1;
@@ -400,6 +526,13 @@ int main(int argc, char **argv) {
       setsockopt(0, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
       setsockopt(0, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
       j = recvJson(0);
+      // Reading logs must work while connect holds the profile transaction
+      // lock.
+      if (j.value("op", "") == "logs") {
+        operatorName(peer.uid, policy());
+        sendJson(0, {{"events", connectionLog()}});
+        return 0;
+      }
     }
     int lock =
         open((state / "lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);

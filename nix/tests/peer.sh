@@ -7,7 +7,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=test-ca -keyout ca.k
 for name in server client; do
   openssl req -new -newkey rsa:2048 -nodes -subj /CN=$name -keyout $name.key -out $name.req
   printf 'keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=%sAuth\n' "$name" > extensions
-  echo "subjectAltName=IP:10.44.0.1,IP:192.0.2.2" >> extensions
+  echo "subjectAltName=IP:10.44.0.1,IP:192.0.2.2,IP:198.51.100.8" >> extensions
   openssl x509 -req -in $name.req -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile extensions -out $name.crt
 done
 ip -n peer link set lo up

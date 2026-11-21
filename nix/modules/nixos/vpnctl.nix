@@ -17,10 +17,19 @@ let
     ip: "${if lib.hasInfix ":" ip then "ip6" else "ip"} daddr ${ip} meta mark set 0x7652 accept";
   daemon = "${cfg.package}/bin/vpnctl-daemon";
   ip = "${pkgs.iproute2}/bin/ip";
+  networkHelper = "${pkgs.python3}/bin/python3 ${../../../packaging/network.py.in}";
   unit = "vpnctl-tunnel";
   dns = cfg.routing.directDomains != [ ] || cfg.dns.enable;
   ready = pkgs.writeShellScript "vpnctl-ready" ''
     set -eu
+    # Replies entering the tunnel have no output fwmark. Strict kernel RPF
+    # can therefore look up their source via the physical default route.
+    tun_rpf=/proc/sys/net/ipv4/conf/vpnctl0/rp_filter
+    read -r all_rpf < /proc/sys/net/ipv4/conf/all/rp_filter
+    read -r current_rpf < "$tun_rpf"
+    if [ "$all_rpf" -lt 2 ] && [ "$current_rpf" -lt 2 ] && { [ "$current_rpf" = 1 ] || [ "$all_rpf" = 1 ]; }; then
+      echo 2 > "$tun_rpf"
+    fi
     ${ip} -4 route replace default dev vpnctl0 table 30201 metric 10
     if ${ip} -6 addr show dev vpnctl0 scope global | ${pkgs.gnugrep}/bin/grep -q inet6; then
       ${ip} -6 route replace default dev vpnctl0 table 30201 metric 10
@@ -191,6 +200,7 @@ in
       };
     };
     systemd.services.${unit} = {
+      path = [ pkgs.iproute2 pkgs.nftables ];
       wantedBy = lib.optional cfg.openvpn.autoConnect "multi-user.target";
       after = [
         "network-online.target"
@@ -217,8 +227,14 @@ in
         ExecStartPost = [
           "${daemon} wait-ready"
           ready
+          "${networkHelper} source-ready"
+          "-${daemon} routes-ready"
         ];
-        ExecStopPost = fallback "del";
+        ExecStopPost = [
+          "-${daemon} tunnel-stopped"
+          (fallback "del")
+          "${networkHelper} source-clear"
+        ];
         ExecStart = lib.concatStringsSep " " [
           "${pkgs.openvpn}/sbin/openvpn"
           "--config /run/vpnctl-tunnel/client.ovpn"

@@ -1,5 +1,6 @@
 #include "vpnctl/core.hpp"
 #include <arpa/inet.h>
+#include <cerrno>
 #include <chrono>
 #include <fcntl.h>
 #include <fstream>
@@ -8,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <system_error>
 #include <unistd.h>
 namespace vpn {
 std::string read(const fs::path &p) {
@@ -122,10 +124,13 @@ Json recvJson(int fd) {
 }
 Json rpc(const Json &j) {
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    throw std::system_error(errno, std::generic_category(), "create VPNCTL socket");
   sockaddr_un a{AF_UNIX, "/run/vpnctl/control.sock"};
   try {
-    require(connect(fd, (sockaddr *)&a, sizeof a) == 0,
-            "vpnctl socket unavailable or access denied");
+    if (connect(fd, (sockaddr *)&a, sizeof a) != 0)
+      throw std::system_error(errno, std::generic_category(),
+                              "connect /run/vpnctl/control.sock");
     timeval t{120, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
     sendJson(fd, j);

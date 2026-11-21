@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import syslog
 
 import dns.message
 import dns.query
@@ -45,6 +46,7 @@ def prepare():
     content = source.read_bytes()
     if hashlib.sha256(content).hexdigest() != json.loads(Path(str(source)+".json").read_text())["sha256"]:
         raise ValueError("stored profile checksum mismatch")
+    syslog.syslog("Profile: stored checksum verified")
     lines = content.decode("ascii").splitlines()
     nameservers = json.loads(Path("/etc/vpnctl/policy.json").read_text())["bootstrapDNS"]
     proto = "udp"
@@ -65,7 +67,10 @@ def prepare():
             except ValueError:
                 mode = args[1] if len(args) > 1 else proto
                 families = ["AAAA"] if "6" in mode else ["A"] if "4" in mode else ["A","AAAA"]
-                for ip in bootstrap(host, nameservers, families):
+                syslog.syslog("DNS: resolving VPN endpoint via bootstrap resolver")
+                addresses = bootstrap(host, nameservers, families)
+                syslog.syslog(f"DNS: bootstrap returned {len(addresses)} endpoint addresses")
+                for ip in addresses:
                     output.append(" ".join(["remote",ip,*args]))
                 continue
         output.append(line)
@@ -73,4 +78,18 @@ def prepare():
 
 
 if __name__ == "__main__":
-    prepare()
+    syslog.openlog("vpnctl-events", syslog.LOG_PID, syslog.LOG_DAEMON)
+    syslog.syslog("Routing: fallback installed; preparing OpenVPN profile")
+    try:
+        prepare()
+    except Exception as exc:
+        # Report fixed reasons only. Exception text may include profile contents.
+        if isinstance(exc, RuntimeError) and str(exc).startswith("no numeric address"):
+            reason = "bootstrap DNS did not resolve the VPN endpoint"
+        elif isinstance(exc, ValueError) and str(exc) == "stored profile checksum mismatch":
+            reason = "stored profile checksum mismatch"
+        else:
+            reason = "profile preparation failed"
+        syslog.syslog(syslog.LOG_ERR, "Profile: " + reason)
+        raise SystemExit(reason)
+    syslog.syslog("Profile: runtime configuration ready")

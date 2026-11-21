@@ -8,6 +8,9 @@ from pathlib import Path
 
 GUARD = 'oifname != { "lo", "vpnctl0" } meta mark != { 0x7652, 0x7653 } counter drop'
 TABLE = "30201"
+SOURCE_TABLE = "30200"
+SOURCE_RULE = ["pref", SOURCE_TABLE, "iif", "lo", "fwmark", "0/0xffffffff", "lookup", SOURCE_TABLE]
+SOURCE_OWNER = Path("/run/vpnctl-tunnel/source-routing")
 POLICY = Path("/etc/vpnctl/policy.json")
 TEMPLATE = Path("@CMAKE_INSTALL_FULL_DATADIR@/vpnctl/routing.nft.in")
 
@@ -50,8 +53,63 @@ def routing():
         run("ip", family, "rule", "add", "pref", TABLE, "fwmark", "0x7651", "lookup", TABLE)
 
 
+def source_ready():
+    """Let local sockets choose a tunnel source before nft OUTPUT sees their first packet."""
+    addresses = json.loads(run("ip", "-4", "-j", "addr", "show", "dev", "vpnctl0",
+                               capture_output=True).stdout)
+    local = [str(ipaddress.IPv4Address(a["local"])) for dev in addresses for a in dev["addr_info"]
+             if a["scope"] == "global"]
+    if not local:
+        return  # IPv6-only tunnel.
+    rules = json.loads(run("ip", "-4", "-N", "-j", "rule", "show", capture_output=True).stdout)
+    routes = json.loads(run("ip", "-4", "-N", "-j", "route", "show", "table", "all",
+                            capture_output=True).stdout)
+    uses_table = any(str(r.get("table")) == SOURCE_TABLE for r in [*rules, *routes])
+    if uses_table or any(r.get("priority") == int(SOURCE_TABLE) for r in rules):
+        raise ValueError("IPv4 routing table or rule 30200 is already in use")
+
+    # A DIRECT exception can reroute a socket that already has a tunnel
+    # source. Translate only those addresses on the final physical egress.
+    run("nft", "-f", "-", input=(
+        "add chain inet vpnctl_session direct_source { type nat hook postrouting priority srcnat - 1; }\n"
+        "flush chain inet vpnctl_session direct_source\n"
+        "add rule inet vpnctl_session direct_source meta mark 0x7652 "
+        'oifname != { "lo", "vpnctl0" } ip saddr { ' + ", ".join(local) + " } masquerade\n"))
+    SOURCE_OWNER.touch(mode=0o600)
+    run("ip", "-4", "route", "add", "default", "dev", "vpnctl0", "src", local[0],
+        "table", SOURCE_TABLE)
+    run("ip", "-4", "rule", "add", *SOURCE_RULE)
+
+
+def source_clear():
+    if SOURCE_OWNER.exists():
+        # The kernel normally removes the device route when OpenVPN closes TUN.
+        # An empty table falls through even if the service died mid-cleanup.
+        rules = json.loads(run("ip", "-4", "-N", "-j", "rule", "show", capture_output=True).stdout)
+        if any(r.get("priority") == int(SOURCE_TABLE) and str(r.get("table")) == SOURCE_TABLE for r in rules):
+            run("ip", "-4", "rule", "del", *SOURCE_RULE)
+        if Path("/sys/class/net/vpnctl0").exists():
+            routes = json.loads(run("ip", "-4", "-N", "-j", "route", "show", "table", "all",
+                                    capture_output=True).stdout)
+            if any(str(r.get("table")) == SOURCE_TABLE and r.get("dev") == "vpnctl0" and
+                   r.get("dst") == "default" for r in routes):
+                run("ip", "-4", "route", "del", "default", "dev", "vpnctl0", "table", SOURCE_TABLE)
+        run("nft", "-f", "-", input="flush chain inet vpnctl_session direct_source\n"
+                                    "delete chain inet vpnctl_session direct_source\n")
+        SOURCE_OWNER.unlink()
+
+
 def main(op):
-    if op == "routing":
+    if op == "stop-tunnel":
+        try:
+            main("clear")
+        finally:
+            source_clear()
+    elif op == "source-ready":
+        source_ready()
+    elif op == "source-clear":
+        source_clear()
+    elif op == "routing":
         routing()
     elif op == "stop-routing":
         for family in ("-4", "-6"):
