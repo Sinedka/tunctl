@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply VPNCTL boot preference
+After=network-online.target vpnctl-routing.service
+Requires=vpnctl-routing.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/vpnctl-daemon autolaunch

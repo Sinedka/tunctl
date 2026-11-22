@@ -4,7 +4,7 @@
   cmake,
   openssl,
   nlohmann_json,
-  ncurses,
+  ftxui,
   zenity,
   python3,
   makeWrapper,
@@ -36,7 +36,7 @@ stdenv.mkDerivation {
   buildInputs = [
     openssl
     nlohmann_json
-    ncurses
+    ftxui
     python3
   ];
   cmakeFlags = [ "-DVPNCTL_NATIVE_SYSTEMD=OFF" ];

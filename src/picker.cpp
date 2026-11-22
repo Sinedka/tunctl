@@ -1,9 +1,9 @@
 #include "picker.hpp"
+#include "tui.hpp"
 #include "vpnctl/core.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
-#include <curses.h>
 #include <unistd.h>
 
 namespace vpn {
@@ -41,66 +41,59 @@ std::vector<Entry> entries(const fs::path &dir, PickMode mode, bool hidden) {
   return result;
 }
 
-std::optional<fs::path> browse(fs::path dir, PickMode mode,
+std::optional<fs::path> browse(Terminal &ui, fs::path dir, PickMode mode,
                                const std::string &title) {
   bool hidden = false;
   int index = 0;
   auto list = entries(dir, mode, hidden);
   std::string note;
-  timeout(-1);
+
   while (true) {
-    erase();
-    auto line = [](int y, const std::string &s) {
-      if (y >= 0 && y < LINES)
-        mvaddnstr(y, 0, s.c_str(), std::max(0, COLS - 1));
-    };
-    line(0, title);
-    line(1, dir.string());
-    int height = std::max(1, LINES - 6);
+    ui.begin(-1, "", title);
+    ui.row(1, dir.string());
+    int height = std::max(1, ui.height() - 6);
     int top = std::max(0, index - height + 1);
     for (int n = top; n < int(list.size()) && n < top + height; ++n) {
       const auto &item = list[n];
-      if (n == index)
-        attron(A_REVERSE);
-      line(3 + n - top, n == 0 ? "../"
-                               : item.path.filename().string() +
-                                     (item.directory ? "/" : ""));
-      if (n == index)
-        attroff(A_REVERSE);
+      std::string name =
+          n == 0 ? "../"
+                 : item.path.filename().string() + (item.directory ? "/" : "");
+      ui.row(3 + n - top, (n == index ? "> " : "  ") + name, n);
     }
-    line(LINES - 2, note);
+    ui.notice = note;
     std::string help = "Enter open   Esc cancel   . hidden";
     if (mode == PickMode::directory)
       help += "   Space select current folder";
     if (mode == PickMode::saveRules)
       help += "   n new file";
-    line(LINES - 1, help);
-    refresh();
-    int key = getch();
+    ui.actions = {{"Open", '\n'}, {"Cancel", 27}};
+    if (mode == PickMode::directory)
+      ui.actions.emplace_back("Choose folder", ' ');
+    if (mode == PickMode::saveRules)
+      ui.actions.emplace_back("New file", 'n');
+    ui.footer = help;
+    ui.show();
+    int key = ui.key(-1);
+    if (key == Terminal::RowClick) {
+      index = ui.clickedRow;
+      continue;
+    }
     if (key == 27 || key == 'q')
       return {};
-    if (key == KEY_UP)
-      index = std::max(0, index - 1);
-    if (key == KEY_DOWN)
-      index = std::min(int(list.size()) - 1, index + 1);
+    if (key == Terminal::Up)
+      index = std::max(0, index - ui.steps);
+    if (key == Terminal::Down)
+      index = std::min(int(list.size()) - 1, index + ui.steps);
     if (mode == PickMode::directory && key == ' ')
       return dir;
     if (mode == PickMode::saveRules && key == 'n') {
-      move(LINES - 1, 0);
-      clrtoeol();
-      addstr("Filename (empty cancels): ");
-      char name[256]{};
-      echo();
-      curs_set(1);
-      int rc = getnstr(name, sizeof(name) - 1);
-      noecho();
-      curs_set(0);
-      if (rc != ERR && *name && fs::path(name).filename() == name &&
-          std::string_view(name) != "." && std::string_view(name) != "..")
+      auto name = ui.prompt("Filename (empty cancels): ");
+      if (!name.empty() && fs::path(name).filename() == name && name != "." &&
+          name != "..")
         return dir / name;
       continue;
     }
-    if (key != '.' && key != '\n' && key != KEY_ENTER)
+    if (key != '.' && key != '\n')
       continue;
     auto next = dir;
     if (key == '.')
@@ -122,7 +115,7 @@ std::optional<fs::path> browse(fs::path dir, PickMode mode,
 } // namespace
 
 std::optional<fs::path> choosePath(PickMode mode, const std::string &title,
-                                   bool inTui) {
+                                   Terminal *terminal) {
   require(geteuid() != 0,
           "run the file chooser as a normal user, or specify a path");
   require(isatty(STDIN_FILENO) && isatty(STDOUT_FILENO),
@@ -165,23 +158,10 @@ std::optional<fs::path> choosePath(PickMode mode, const std::string &title,
     }
   }
   if (!selected) {
-    if (!inTui) {
-      initscr();
-      cbreak();
-      noecho();
-      keypad(stdscr, true);
-      curs_set(0);
-    }
-    struct Restore {
-      bool standalone;
-      ~Restore() {
-        if (standalone)
-          endwin();
-        else
-          touchwin(stdscr);
-      }
-    } restore{!inTui};
-    selected = browse(directory, mode, title);
+    std::optional<Terminal> standalone;
+    if (!terminal)
+      terminal = &standalone.emplace();
+    selected = browse(*terminal, directory, mode, title);
   }
   if (selected)
     directory =

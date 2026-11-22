@@ -1,18 +1,21 @@
 #include "picker.hpp"
+#include "tui.hpp"
 #include "vpnctl/core.hpp"
 #include <algorithm>
 #include <chrono>
 #include <clocale>
+#include <cmath>
 #include <csignal>
 #include <cstring>
 #include <ctime>
-#include <curses.h>
+#include <fcntl.h>
 #include <future>
 #include <iomanip>
 #include <iostream>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <sys/file.h>
 #include <thread>
 #include <unistd.h>
 
@@ -35,19 +38,44 @@ fs::path xdg(const char *var, const char *fallback) {
   require(home, "HOME is unset");
   return fs::path(home) / fallback / "vpnctl";
 }
-auto prefs() { return xdg("XDG_CONFIG_HOME", ".config") / "settings.json"; }
+fs::path prefs() {
+  auto personal = xdg("XDG_CONFIG_HOME", ".config") / "locked.json";
+  const fs::path system = "/etc/vpnctl/locked.json";
+  return !fs::exists(personal) && fs::exists(system) ? system : personal;
+}
+Json resetLayer() {
+  return fs::exists(prefs()) ? Json::object() : Json{{"autolaunch", false}};
+}
 auto overrides() {
-  return xdg("XDG_STATE_HOME", ".local/state") / "overrides.json";
+  return xdg("XDG_STATE_HOME", ".local/state") / "unlocked.json";
 }
 Json load(const fs::path &p, Json fallback) {
   return fs::exists(p) ? Json::parse(read(p)) : fallback;
 }
-Json settings() {
-  auto cfg = load(prefs(), Json::object());
+Json unlocked() {
+  if (fs::exists(overrides()))
+    return load(overrides(), Json::object());
+  // Adopt the previous layout on the first edit. Reset writes an empty
+  // layer, so obsolete files can never resurrect a discarded override.
+  auto dir = xdg("XDG_CONFIG_HOME", ".config");
+  auto cfg = fs::exists(dir / "locked.json")
+                 ? Json::object()
+                 : load(dir / "settings.json", Json::object());
   cfg.merge_patch(
       load(overrides().parent_path() / "preferences.json", Json::object()));
+  auto legacy = overrides().parent_path() / "overrides.json";
+  if (fs::exists(legacy))
+    cfg["rules"] = load(legacy, Json::array());
+  if (!fs::exists(prefs()) && !cfg.contains("autolaunch"))
+    cfg["autolaunch"] = false;
   return cfg;
 }
+Json settings(const Json &layer) {
+  auto cfg = load(prefs(), Json::object());
+  cfg.merge_patch(layer);
+  return cfg;
+}
+Json settings() { return settings(unlocked()); }
 std::string slice(std::string s) {
   require(id(s), "invalid application name");
   std::replace(s.begin(), s.end(), '-', '_');
@@ -71,19 +99,57 @@ Json fromSettings(const Json &config) {
                  {"enabled", a.value("enabled", true)}});
   return r;
 }
-Json baseRules() { return fromSettings(settings()); }
-Json rules() { return load(overrides(), baseRules()); }
-Json sync(const Json &r) { return rpc({{"op", "sync"}, {"rules", r}}); }
-void saveRules(const Json &r) {
-  fs::create_directories(overrides().parent_path());
-  auto old = rules();
-  sync(r);
+Json rules(const Json &cfg) { return cfg.value("rules", fromSettings(cfg)); }
+Json rules() { return rules(settings()); }
+class ConfigLock {
+  int fd;
+
+public:
+  ConfigLock() {
+    fs::create_directories(overrides().parent_path());
+    fd = open((overrides().parent_path() / "unlocked.lock").c_str(),
+              O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    require(fd >= 0, "cannot open settings lock");
+    if (flock(fd, LOCK_EX) != 0) {
+      close(fd);
+      throw std::runtime_error("cannot lock settings");
+    }
+  }
+  ~ConfigLock() { close(fd); }
+};
+enum class Apply { local, all, boot };
+Json sendConfig(const Json &layer, Apply mode) {
+  Json j = {{"op", "sync"},
+            {"autolaunch", layer.value("autolaunch", Json(nullptr))}};
+  if (mode == Apply::all)
+    j["rules"] = rules(settings(layer));
+  return rpc(j);
+}
+Json syncCurrent() {
+  ConfigLock lock;
+  return sendConfig(unlocked(), Apply::all);
+}
+void saveConfig(const Json &layer, Apply mode) {
+  ConfigLock lock;
+  auto old = unlocked();
+  write(overrides(), layer.dump(2) + "\n");
   try {
-    write(overrides(), r.dump(2));
+    if (mode != Apply::local)
+      sendConfig(layer, mode);
   } catch (...) {
-    sync(old);
+    write(overrides(), old.dump(2) + "\n");
     throw;
   }
+}
+void initUnlocked() {
+  ConfigLock lock;
+  if (!fs::exists(overrides()))
+    write(overrides(), unlocked().dump(2) + "\n");
+}
+void saveRules(const Json &r) {
+  auto layer = unlocked();
+  layer["rules"] = r;
+  saveConfig(layer, Apply::all);
 }
 Args scope(std::string name, const Args &args) {
   Args a = {"systemd-run",
@@ -247,42 +313,20 @@ std::string diag(std::string test, std::string target, std::string via,
     << endpoint;
   return o.str();
 }
-std::string prompt(const std::string &s) {
-  timeout(-1);
-  echo();
-  curs_set(1);
-  move(LINES - 2, 0);
-  clrtoeol();
-  addnstr(s.c_str(), COLS - 1);
-  char v[1024]{};
-  getnstr(v, sizeof(v) - 1);
-  noecho();
-  curs_set(0);
-  return v;
-}
-bool cancelled() { return getch() == 27; }
-void line(int y, const std::string &s) {
-  if (y >= 0 && y < LINES)
-    mvaddnstr(y, 1, s.c_str(), std::max(0, COLS - 2));
-}
+Terminal *activeTerminal = nullptr;
+bool cancelled() { return activeTerminal && activeTerminal->key(0) == 27; }
 int tui() {
   require(isatty(0) && isatty(1), "open a terminal or use vpnctl status");
-  initscr();
-  struct End {
-    ~End() { endwin(); }
-  } end;
-  cbreak();
-  noecho();
-  keypad(stdscr, true);
-  curs_set(0);
-  start_color();
-  use_default_colors();
+  Terminal ui;
+  activeTerminal = &ui;
+  auto line = [&](int y, const std::string &s) { ui.row(y, s); };
+  auto prompt = [&](const std::string &s) { return ui.prompt(s); };
+  initUnlocked();
   auto cfg = settings();
   auto d = cfg.value("diagnostics", Json::object());
   auto target = d.value("pingTarget", "1.1.1.1");
   int interval = std::clamp(d.value("pingInterval", 5), 1, 3600);
-  init_pair(1, cfg.value("theme", "dark") == "light" ? COLOR_BLUE : COLOR_CYAN,
-            -1);
+  ui.light = cfg.value("theme", "dark") == "light";
   int page = 0, idx = 0, section = 0, scroll = 0;
   std::vector<std::string> sections = {"ip",     "domain", "app",
                                        "tables", "dns",    "guard"};
@@ -293,15 +337,23 @@ int tui() {
   auto historyPath = overrides().parent_path() / "latency.json";
   Json history = load(historyPath, Json::object());
 
-  Json status;
+  const auto choiceFile = overrides().parent_path() / "selected-server.json";
+  std::string choice = load(choiceFile, "").get<std::string>();
+  int firstServer = 0;
+  Json status = Json::object(), rr = Json::array();
+  bool chooseSection = true;
+  std::string inspection;
+  auto nextPoll = std::chrono::steady_clock::time_point::min();
   std::future<Json> connection;
   std::string logText;
-  std::string tabs[] = {"Dashboard",   "Servers",  "Routing",
-                        "Diagnostics", "Settings", "Logs"};
   unsigned long long prevRx = 0, prevTx = 0;
   std::string rates;
   auto last = std::chrono::steady_clock::now();
   while (true) {
+    const bool poll = std::chrono::steady_clock::now() >= nextPoll;
+    if (poll)
+      nextPoll = std::chrono::steady_clock::now() +
+                 std::chrono::milliseconds(page == 5 ? 1000 : interval * 1000);
     try {
       if (connection.valid() && connection.wait_for(std::chrono::seconds(0)) ==
                                     std::future_status::ready) {
@@ -311,13 +363,20 @@ int tui() {
           message = e.what();
         }
       }
-      if (page == 5)
+      if (poll && page == 5)
         logText = rpc({{"op", "logs"}}).at("events").get<std::string>();
-      else
+      else if (poll) {
+        cfg = settings();
+        rr = rules(cfg);
         status = rpc({{"op", "status"}});
+        if (!cfg.contains("routing") && !cfg.contains("rules") &&
+            !status.at("rules").empty()) {
+          rr = status.at("rules");
+        }
+      }
     } catch (const std::exception &e) {
       status = {{"state", "unavailable"}, {"lastError", e.what()}};
-      if (page == 5)
+      if (poll && page == 5)
         logText = e.what();
     }
     auto current =
@@ -330,17 +389,10 @@ int tui() {
       prevTx = 0;
       session = current;
     }
-    erase();
-    attron(COLOR_PAIR(1) | A_BOLD);
-    line(0, page == 5 ? "VPNCTL    Logs"
-                      : "VPNCTL    " + status.value("state", "unknown") +
-                            "    " + status.value("selected", ""));
-    attroff(COLOR_PAIR(1) | A_BOLD);
-    std::string nav;
-    for (int i = 0; i < 6; i++)
-      nav += " " + std::to_string(i + 1) + " " + tabs[i] +
-             (i == page ? " *  " : "    ");
-    line(2, nav);
+    ui.begin(page,
+             page == 5 ? (connection.valid() ? "connecting" : "")
+                       : status.value("state", "unknown"),
+             page == 5 ? "" : status.value("selected", ""));
     auto profiles = status.value("profiles", Json::array());
     std::vector<Json> rows;
     for (auto &p : profiles)
@@ -357,15 +409,50 @@ int tui() {
       return a.at("name") < b.at("name");
     });
 
-    auto rr = rules();
+    auto tableRules = rr;
+    for (const auto &[kind, key] :
+         {std::pair{"ip", "systemIPs"}, {"domain", "domains"}})
+      for (const auto &match : status.value(key, Json::array()))
+        tableRules.push_back(
+            {{"kind", kind}, {"match", match}, {"action", "direct"}});
+    const int adminEnd = static_cast<int>(tableRules.size());
+    auto liveRules = status.value("rules", Json::array());
+    for (const auto &r : liveRules)
+      if (std::find(rr.begin(), rr.end(), r) == rr.end())
+        tableRules.push_back(r);
+    if (page == 2 && chooseSection) {
+      chooseSection = false;
+      for (int n = 0; n < 3; ++n) {
+        if (std::ranges::any_of(tableRules, [&](const Json &r) {
+              return r.at("kind") == sections[n];
+            })) {
+          section = n;
+          break;
+        }
+      }
+    }
     std::vector<int> visible;
-    for (size_t i = 0; i < rr.size(); ++i)
-      if (rr[i].at("kind") == sections[section])
+    for (size_t i = 0; i < tableRules.size(); ++i)
+      if (tableRules[i].at("kind") == sections[section])
         visible.push_back(i);
     int count = page == 1 ? int(rows.size()) : int(visible.size());
     idx = std::clamp(idx, 0, std::max(0, count - 1));
     std::string help = "1-6 views    q quit";
+    const bool canConnect = std::ranges::any_of(
+        profiles, [&](const Json &p) { return p.at("name") == choice; });
+    if (page == 0 || page == 1) {
+      if (canConnect)
+        ui.actions.emplace_back("Connect", 'C');
+      ui.actions.emplace_back("Disconnect", 'd');
+      if (page == 1) {
+        ui.actions.emplace_back("Search", '/');
+        ui.actions.emplace_back("Import", 'i');
+      } else
+        ui.actions.emplace_back("Servers", '2');
+    }
     if (page == 0) {
+      line(3, "Selected     " + (canConnect ? choice : "Choose in Servers"));
+      help = "C connect selected   d disconnect   2 choose server   q quit";
       line(4, "Interface    " + status.value("interface", "-"));
       line(5, "Uptime       " + std::to_string(status.value("uptime_s", 0)) +
                   " s");
@@ -394,28 +481,28 @@ int tui() {
       line(11, "Last error   " + status.value("lastError", "-"));
     }
     if (page == 1) {
-      line(4, "Profile / country / state / endpoint / protocol    filter: " +
-                  search);
-      int top = std::max(0, idx - std::max(0, LINES - 12));
-      for (int i = top; i < int(rows.size()) && i - top < LINES - 10; i++) {
-        auto &p = rows[i];
-        line(
-            6 + i - top,
-            (i == idx ? "> " : "  ") + p["name"].get<std::string>() + "  " +
-                p.value("country", "-") + "  " +
-                (p["name"] == status.value("selected", "")
-                     ? status.value("state", "")
-                     : "") +
-                "  " + p["endpoint"].get<std::string>() + "  " +
-                p["protocol"].get<std::string>() + "   " +
-                (score(p) == 1e12 ? "-" : std::to_string(score(p)) + " ms") +
-                "   " +
-                history.value(p["name"].get<std::string>(), Json::object())
-                    .value("checked", "-") +
-                (marked.contains(p["name"].get<std::string>()) ? "  [x]" : ""));
+      line(4, "Selected: " + (canConnect ? choice : "—") + "   ·   " +
+                  std::to_string(rows.size()) + " profiles" +
+                  (search.empty() ? "" : "   Filter: " + search));
+      int capacity = std::max(1, ui.height() - 12);
+      firstServer = std::clamp(firstServer, std::max(0, idx - capacity + 1),
+                               std::min(idx, std::max(0, count - capacity)));
+      int top = firstServer;
+      for (int i = top; i < int(rows.size()) && i < top + capacity; ++i) {
+        const auto &p = rows[i];
+        auto name = p.at("name").get<std::string>();
+        ui.servers.push_back(
+            {name, p.value("country", "-"),
+             name == status.value("selected", "") ? status.value("state", "")
+                                                  : "",
+             p.at("endpoint"), p.at("protocol"),
+             score(p) == 1e12 ? "—"
+                              : std::to_string(std::lround(score(p))) + " ms",
+             history.value(name, Json::object()).value("checked", "—"),
+             marked.contains(name), i == idx, i});
       }
-      line(5, "i import file/ZIP   I import folder   v/V validate file/folder");
-      help = "Enter connect   d disconnect   x remove   / search   "
+      line(5, "i import file/ZIP   I folder   v/V validate");
+      help = "Enter select   C connect   d disconnect   x remove   / search   "
              "c country  p probe  Space mark  P batch  f fastest  o sort";
     }
     if (page == 2) {
@@ -423,49 +510,70 @@ int tui() {
                   sections[section]);
       if (section >= 3) {
         try {
-          std::istringstream in(
-              rpc({{"op", "inspect"}, {"section", sections[section]}})
-                  .at("text")
-                  .get<std::string>());
+          if (poll)
+            inspection =
+                rpc({{"op", "inspect"}, {"section", sections[section]}})
+                    .at("text")
+                    .get<std::string>();
+          std::istringstream in(inspection);
           int n = 0;
           for (std::string l; std::getline(in, l); ++n)
-            if (n >= scroll && n - scroll < LINES - 10)
+            if (n >= scroll && n - scroll < ui.height() - 10)
               line(6 + n - scroll, l);
         } catch (const std::exception &e) {
           message = e.what();
         }
         help = "[ / ] section    arrows scroll    q quit";
       } else {
-        int top = std::max(0, idx - std::max(0, LINES - 12));
-        bool same = status.value("rules", Json::array()) == rr;
-        for (int i = top; i < count && i - top < LINES - 10; i++) {
+        int top = std::max(0, idx - std::max(0, ui.height() - 12));
+        auto baselineRules = fromSettings(load(prefs(), Json::object()));
+        for (int i = top; i < count && i - top < ui.height() - 10; i++) {
           int at = visible[i];
-          auto r = rr[at];
+          bool admin = size_t(at) >= rr.size();
+          auto r = tableRules[at];
           std::string m = r.at("match");
-          std::string applied =
-              same ? status.at("ruleStates")[at].get<std::string>()
-                   : "pending sync";
-          if (r.at("kind") == "ip")
-            for (auto &sys : status.value("systemIPs", Json::array()))
-              if (covers(sys, m))
-                applied = "system DIRECT wins";
-          for (int j : visible) {
-            if (j == at)
-              break;
-            if (rr[j].value("enabled", true) &&
-                (rr[j].at("match") == m ||
-                 (r.at("kind") == "ip" && covers(rr[j].at("match"), m)))) {
-              applied = "rule " + std::to_string(j + 1) + " wins";
-              break;
+          std::string applied;
+          if (admin)
+            applied =
+                at < adminEnd ? "system policy" : "backend only · pending sync";
+          else {
+            auto it = std::find(liveRules.begin(), liveRules.end(), r);
+            applied = it == liveRules.end() ? "pending sync"
+                                            : status.at("ruleStates")
+                                                  .at(it - liveRules.begin())
+                                                  .get<std::string>();
+            applied += std::find(baselineRules.begin(), baselineRules.end(),
+                                 r) == baselineRules.end()
+                           ? " · unlocked"
+                           : " · baseline";
+          }
+          if (!admin) {
+            if (r.at("kind") == "ip")
+              for (auto &sys : status.value("systemIPs", Json::array()))
+                if (covers(sys, m))
+                  applied = "system DIRECT wins";
+            for (int j : visible) {
+              if (j == at)
+                break;
+              if (rr[j].value("enabled", true) &&
+                  (rr[j].at("match") == m ||
+                   (r.at("kind") == "ip" && covers(rr[j].at("match"), m)))) {
+                applied = "rule " + std::to_string(j + 1) + " wins";
+                break;
+              }
             }
           }
-          line(6 + i - top, (i == idx ? "> " : "  ") + std::to_string(at + 1) +
-                                (section == 2   ? "  P2  "
-                                 : section == 0 ? "  P3  "
-                                                : "  P4  ") +
-                                m + "   " + r["action"].get<std::string>() +
-                                "   " + applied);
+          ui.row(6 + i - top,
+                 (i == idx ? "> " : "  ") + std::to_string(at + 1) +
+                     (section == 2   ? "  P2  "
+                      : section == 0 ? "  P3  "
+                                     : "  P4  ") +
+                     m + "   " + r["action"].get<std::string>() + "   " +
+                     applied,
+                 i);
         }
+        if (count == 0)
+          line(6, "No " + sections[section] + " rules. Use Add.");
         help = "[ / ] sections   a add   e edit   space toggle   x remove   s "
                "sync   r reset";
       }
@@ -481,14 +589,29 @@ int tui() {
       help = "Esc cancels running diagnostic    q quit";
     }
     if (page == 4) {
-      line(4, "Declarative: " + prefs().string());
-      line(6, "Runtime:     " + overrides().string());
-      line(8, "System DIRECT IPs: " +
-                  status.value("systemIPs", Json::array()).dump());
-      line(10, "DNS domains: " + status.value("domains", Json::array()).dump());
+      line(4, "Autolaunch    " +
+                  std::string(
+                      status.value("autolaunch", cfg.value("autolaunch", false))
+                          ? "On"
+                          : "Off") +
+                  "   ·   last successful server");
+      line(5, "Theme         " + cfg.value("theme", "dark"));
+      line(6, "Ping target   " + target);
+      line(7, "Refresh       " + std::to_string(interval) + " s");
+      line(8, "Routing       " + std::to_string(rr.size()) + " user rules · " +
+                  std::to_string(tableRules.size() - rr.size()) +
+                  " system rules");
+      line(9,
+           "Kill switch   " +
+               std::string(status.value("killSwitch", false) ? "On" : "Off") +
+               "   ·   system policy");
+      line(10, "Unlocked      " + overrides().string());
+      line(11, "Baseline      " + (fs::exists(prefs())
+                                       ? prefs().string()
+                                       : std::string("built-in defaults")));
       line(12, "e  Export routing rules to a JSON file");
-      help = "t theme    g ping target    s synchronize    r reset rules    q "
-             "quit";
+      help = "a autolaunch   t theme   g ping target   j refresh interval   r "
+             "reset settings";
     }
     if (page == 5) {
       std::vector<std::string> entries;
@@ -496,11 +619,11 @@ int tui() {
       for (std::string row; std::getline(events, row);) {
         // Wrap the message so narrow terminals can still show the failure
         // reason.
-        const size_t width = std::max(1, COLS - 2);
+        const size_t width = std::max(1, ui.width() - 2);
         for (size_t pos = 0; pos < row.size(); pos += width)
           entries.push_back(row.substr(pos, width));
       }
-      int height = std::max(1, LINES - 6);
+      int height = std::max(1, ui.height() - 6);
       scroll = std::clamp(scroll, 0, std::max(0, int(entries.size()) - height));
       line(3,
            message.empty() ? "Connection events (UTC, newest first)" : message);
@@ -508,28 +631,62 @@ int tui() {
         line(5 + i, entries[scroll + i]);
       help = "Up/Down or PgUp/PgDn scroll   Home latest   q quit";
     } else {
-      int y = std::max(5, LINES - 7);
-      std::istringstream msg(message);
-      for (std::string l; std::getline(msg, l) && y < LINES - 2;)
-        line(y++, l);
+      ui.notice = message;
     }
-    line(LINES - 1, help);
-    refresh();
-    timeout(page == 5 ? 1000 : interval * 1000);
-    int k = getch();
+    if (page == 2) {
+      ui.actions = {{"IP", 'I'},
+                    {"Domains", 'D'},
+                    {"Apps", 'A'},
+                    {"‹ Section", '['},
+                    {"Section ›", ']'}};
+      if (section < 3) {
+        ui.actions.emplace_back("Add", 'a');
+        ui.actions.emplace_back("Edit", 'e');
+        ui.actions.emplace_back("Toggle", ' ');
+        ui.actions.emplace_back("Delete", 'x');
+      }
+    } else if (page == 3)
+      ui.actions = {
+          {"Ping", 'p'}, {"DNS", 'n'}, {"Public IP", 'i'}, {"Path", 'h'}};
+    else if (page == 4)
+      ui.actions = {{"Routing", '3'},     {"Autolaunch", 'a'}, {"Theme", 't'},
+                    {"Ping target", 'g'}, {"Interval", 'j'},   {"Export", 'e'},
+                    {"Sync", 's'},        {"Reset", 'r'}};
+    if (page == 5)
+      ui.actions = {{"Newest", Terminal::Home},
+                    {"Page up", Terminal::PgUp},
+                    {"Page down", Terminal::PgDown}};
+    ui.footer = help;
+    ui.show();
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         nextPoll - std::chrono::steady_clock::now())
+                         .count();
+    int k = ui.key(static_cast<int>(std::max<long long>(0, remaining)));
+    if (k == -1)
+      continue;
+    if (k == Terminal::RowClick && (page == 1 || page == 2)) {
+      if (ui.clickedRow < 0 || ui.clickedRow >= count)
+        continue;
+      idx = ui.clickedRow;
+      if (page == 2)
+        continue;
+      k = '\n';
+    }
     if (k == 'q')
       return 0;
     if (page == 5) {
-      if (k == KEY_UP || k == KEY_DOWN)
-        scroll += k == KEY_UP ? -1 : 1;
-      if (k == KEY_PPAGE || k == KEY_NPAGE)
-        scroll += (k == KEY_PPAGE ? -1 : 1) * std::max(1, LINES - 6);
-      if (k == KEY_HOME)
+      if (k == Terminal::Up || k == Terminal::Down)
+        scroll += k == Terminal::Up ? -ui.steps : ui.steps;
+      if (k == Terminal::PgUp || k == Terminal::PgDown)
+        scroll += (k == Terminal::PgUp ? -1 : 1) * std::max(1, ui.height() - 6);
+      if (k == Terminal::Home)
         scroll = 0;
-      if (connection.valid())
+      if (connection.valid() || k == Terminal::Home || k == Terminal::PgUp ||
+          k == Terminal::PgDown || k == Terminal::Up || k == Terminal::Down)
         continue;
     }
     if (k >= '1' && k <= '6') {
+      nextPoll = {};
       page = k - '1';
       scroll = 0;
       idx = 0;
@@ -537,25 +694,47 @@ int tui() {
 
       continue;
     }
+    if (page == 2 && (k == 'I' || k == 'D' || k == 'A')) {
+      section = k == 'I' ? 0 : k == 'D' ? 1 : 2;
+      idx = scroll = 0;
+      continue;
+    }
     if (page == 2 && (k == '[' || k == ']')) {
+      nextPoll = {};
       section = (section + (k == ']' ? 1 : 5)) % 6;
       idx = 0;
       scroll = 0;
       continue;
     }
-    if (page == 2 && section >= 3 && (k == KEY_DOWN || k == KEY_UP)) {
-      scroll = std::max(0, scroll + (k == KEY_DOWN ? 1 : -1));
+    if (page == 2 && section >= 3 &&
+        (k == Terminal::Down || k == Terminal::Up)) {
+      scroll =
+          std::max(0, scroll + (k == Terminal::Down ? ui.steps : -ui.steps));
       continue;
     }
-    if (k == KEY_DOWN) {
-      idx++;
+    if (k == Terminal::Down) {
+      idx += ui.steps;
       continue;
     }
-    if (k == KEY_UP) {
-      idx--;
+    if (k == Terminal::Up) {
+      idx -= ui.steps;
       continue;
     }
     try {
+      nextPoll = {};
+      if ((page == 0 || page == 1) && k == 'C' && canConnect) {
+        // Exiting the viewer does not cancel the daemon's transaction.
+        std::packaged_task<Json()> request(
+            [choice] { return rpc({{"op", "connect"}, {"name", choice}}); });
+        connection = request.get_future();
+        std::thread(std::move(request)).detach();
+        page = 5;
+        scroll = 0;
+        status["state"] = "connecting";
+        message = "Connecting " + choice;
+      }
+      if ((page == 0 || page == 1) && k == 'd')
+        message = rpc({{"op", "disconnect"}}).dump();
       if (page == 1) {
         if (k == '/')
           search = prompt("Filter: ");
@@ -566,7 +745,7 @@ int tui() {
           auto path = choosePath(mode,
                                  validate ? "Validate OpenVPN profiles"
                                           : "Import OpenVPN profiles",
-                                 true);
+                                 &ui);
           if (path) {
             Args cmd{importHelper(), *path};
             if (validate)
@@ -574,8 +753,7 @@ int tui() {
             message = output(cmd, 120, nullptr);
           }
         }
-        if (k == 'd')
-          message = rpc({{"op", "disconnect"}}).dump();
+
         if (!rows.empty()) {
           auto n = rows[idx]["name"];
           if (k == 'c')
@@ -584,15 +762,11 @@ int tui() {
                            {"country", prompt("Country (name or ISO code): ")}})
                           .dump();
           if (k == '\n') {
-            // Exiting the viewer does not cancel the daemon's transaction.
-            std::packaged_task<Json()> request(
-                [n] { return rpc({{"op", "connect"}, {"name", n}}); });
-            connection = request.get_future();
-            std::thread(std::move(request)).detach();
-            page = 5;
-            scroll = 0;
-            status["state"] = "connecting";
-            message = "Connecting " + n.get<std::string>();
+            auto name = n.get<std::string>();
+            fs::create_directories(choiceFile.parent_path());
+            write(choiceFile, n.dump());
+            choice = name;
+            message = "Selected " + name;
           }
           if (k == 'x' && prompt("Type DELETE: ") == "DELETE")
             message = rpc({{"op", "remove"}, {"name", n}}).dump();
@@ -612,13 +786,13 @@ int tui() {
           if (k == 'p' || k == 'P') {
             if (k == 'P')
               require(!marked.empty(), "mark servers with Space");
-            nodelay(stdscr, true);
+
             for (auto &p : rows) {
               auto name = p["name"].get<std::string>();
               if (k == 'p' ? p["name"] != n : !marked.contains(name))
                 continue;
-              line(LINES - 1, "Measuring " + name + "  Esc cancels");
-              refresh();
+              ui.footer = "Measuring " + name + "  Esc cancels";
+              ui.show();
               auto report =
                   output(scope("probe_direct",
                                {executable(), "measured", "endpoint",
@@ -639,6 +813,9 @@ int tui() {
       }
       if (page == 2 && section < 3 &&
           (k == 'a' || k == 'e' || k == 'x' || k == ' ')) {
+        if (k != 'a' && !visible.empty())
+          require(size_t(visible.at(idx)) < rr.size(),
+                  "Rule is managed by the system administrator");
         if (k == 'a' || (k == 'e' && !visible.empty())) {
           auto kind = sections[section], m = prompt("Match: "),
                a = prompt("Action (vpn/direct): ");
@@ -661,16 +838,20 @@ int tui() {
         message = "Applied";
       }
       if ((page == 2 || page == 4) && k == 's')
-        message = sync(rules()).dump();
+        message = syncCurrent().dump();
       if ((page == 2 || page == 4) && k == 'r' &&
           prompt("Type RESET: ") == "RESET") {
-        sync(baseRules());
-        fs::remove(overrides());
-        message = "Declarative rules applied";
+        saveConfig(resetLayer(), Apply::all);
+        cfg = settings();
+        auto defaults = cfg.value("diagnostics", Json::object());
+        target = defaults.value("pingTarget", "1.1.1.1");
+        interval = std::clamp(defaults.value("pingInterval", 5), 1, 3600);
+        ui.light = cfg.value("theme", "dark") == "light";
+        message = "Restored baseline settings";
       }
       if (page == 4 && k == 'e') {
         if (auto path =
-                choosePath(PickMode::saveRules, "Save routing rules", true)) {
+                choosePath(PickMode::saveRules, "Save routing rules", &ui)) {
           auto type = fs::symlink_status(*path).type();
           require(type == fs::file_type::not_found ||
                       type == fs::file_type::regular,
@@ -682,21 +863,39 @@ int tui() {
           }
         }
       }
-      if (page == 4 && (k == 't' || k == 'g')) {
-        auto file = overrides().parent_path() / "preferences.json";
-        auto pref = load(file, Json::object());
+      if (page == 4 && (k == 't' || k == 'g' || k == 'a' || k == 'j')) {
+        auto layer = unlocked();
+        if (k == 'a')
+          layer["autolaunch"] = !status.value("autolaunch", false);
         if (k == 'g') {
-          target = prompt("Ping target: ");
-          require(domain(target) || cidr(target), "invalid target");
-          pref["diagnostics"]["pingTarget"] = target;
-        } else {
-          auto light = settings().value("theme", "dark") == "dark";
-          pref["theme"] = light ? "light" : "dark";
-          init_pair(1, light ? COLOR_BLUE : COLOR_CYAN, -1);
+          auto value = prompt("Ping target");
+          if (value.empty())
+            continue;
+          require((domain(value) && !value.starts_with("*.")) ||
+                      (cidr(value) && !value.contains('/')),
+                  "invalid ping target");
+          layer["diagnostics"]["pingTarget"] = value;
         }
-        fs::create_directories(file.parent_path());
-        write(file, pref.dump(2));
-        message = "Preferences saved";
+        if (k == 'j') {
+          auto value = prompt("Refresh interval in seconds (1–3600)");
+          if (value.empty())
+            continue;
+          require(value.size() <= 4 &&
+                      value.find_first_not_of("0123456789") == value.npos,
+                  "invalid interval");
+          int n = std::stoi(value);
+          require(n >= 1 && n <= 3600, "invalid interval");
+          layer["diagnostics"]["pingInterval"] = n;
+        }
+        if (k == 't')
+          layer["theme"] = ui.light ? "dark" : "light";
+        saveConfig(layer, k == 'a' ? Apply::boot : Apply::local);
+        cfg = settings(layer);
+        auto diagnostics = cfg.value("diagnostics", Json::object());
+        target = diagnostics.value("pingTarget", "1.1.1.1");
+        interval = diagnostics.value("pingInterval", 5);
+        ui.light = cfg.value("theme", "dark") == "light";
+        message = "Settings saved";
       }
       if (page == 3) {
         if (k == 'h')
@@ -710,9 +909,9 @@ int tui() {
         if (tests.contains(k)) {
           bool confirmed = (k != 'b' && k != 'u') ||
                            prompt("Transfer 1 MiB? Type YES: ") == "YES";
-          nodelay(stdscr, true);
-          line(LINES - 1, "Measuring... Esc cancels");
-          refresh();
+
+          ui.footer = "Measuring... Esc cancels";
+          ui.show();
           if (directTest) {
             Args inner = {executable(), "measured", tests[k], target, "direct"};
             if (confirmed)
@@ -758,20 +957,22 @@ int main(int argc, char **argv) {
       auto r = rules();
       auto live = rpc({{"op", "status"}});
       if (live.at("allowDirectProbe") == true && live.at("rules") != r)
-        sync(r);
+        syncCurrent();
       execute(scope(a[1], Args(a.begin() + 2, a.end())));
     }
     if ((op == "import" || op == "validate" || op == "check-settings") &&
         a.size() == 1) {
       auto mode =
           op == "check-settings" ? PickMode::settings : PickMode::profile;
-      auto path = choosePath(mode, "VPNCTL: " + op, false);
+      auto path = choosePath(mode, "VPNCTL: " + op, nullptr);
       if (!path)
         return 0;
       a.push_back(*path);
     }
     if (op == "check-settings" && a.size() == 2) {
       auto c = Json::parse(read(a[1]));
+      require(!c.contains("autolaunch") || c.at("autolaunch").is_boolean(),
+              "invalid autolaunch");
       auto d = c.value("diagnostics", Json::object());
       auto target = d.value("pingTarget", "1.1.1.1");
       require((domain(target) && !target.starts_with("*.")) ||
@@ -830,13 +1031,12 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (op == "reset") {
-      sync(baseRules());
-      fs::remove(overrides());
+      saveConfig(resetLayer(), Apply::all);
       return 0;
     }
     Json r;
     if (op == "sync")
-      r = sync(rules());
+      r = syncCurrent();
     else if ((op == "connect" || op == "remove") && a.size() == 2)
       r = rpc({{"op", op}, {"name", a[1]}});
     else {

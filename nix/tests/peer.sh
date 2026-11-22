@@ -30,8 +30,8 @@ cp /home/tester/bundle/{first,second}.ovpn
 sed 's/1194/1195/' /home/tester/bundle/first.ovpn > /home/tester/bundle/broken.ovpn
 chown -R tester:users /home/tester/bundle
 ip netns exec peer python3 /etc/http-peer.py </dev/null >/tmp/http-peer.log 2>&1 &
-mkdir -p /home/tester/.config/vpnctl
-cat >/home/tester/.config/vpnctl/settings.json <<'JSON'
+mkdir -p /home/tester/.local/state/vpnctl
+cat >/home/tester/.local/state/vpnctl/unlocked.json <<'JSON'
 {"diagnostics":{"downloadUrl":"https://10.44.0.1:8443/down","uploadUrl":"https://10.44.0.1:8443/up","publicIPUrl":"https://10.44.0.1:8443/ip"}}
 JSON
-chown -R tester:users /home/tester/.config
+chown -R tester:users /home/tester/.local

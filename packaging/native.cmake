@@ -1,6 +1,6 @@
 set(native_dir "${CMAKE_CURRENT_LIST_DIR}")
 set(unit_dir "lib/systemd/system" CACHE STRING "systemd system unit installation directory")
-foreach(unit vpnctl.socket vpnctl@.service vpnctl-routing.service vpnctl-session.service
+foreach(unit vpnctl.socket vpnctl-autolaunch.service vpnctl@.service vpnctl-routing.service vpnctl-session.service
              vpnctl-tunnel.service vpnctl-refresh.service vpnctl-refresh.timer vpnctl-dns.service)
   configure_file("${native_dir}/systemd/${unit}.in" "${CMAKE_CURRENT_BINARY_DIR}/${unit}" @ONLY)
   install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${unit}" DESTINATION "${unit_dir}")

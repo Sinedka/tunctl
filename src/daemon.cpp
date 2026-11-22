@@ -115,15 +115,19 @@ void event(const std::string &text) {
     events.resize(4096);
   write(p, events);
 }
-Json userRules() {
+Json savedPolicy(const Json &cfg) {
   auto path = state / "rules.json";
   if (fs::exists(path)) {
     auto layer = Json::parse(read(path));
-    if (layer.is_object() && layer.value("owner", "") ==
-                                 policy().at("policyUser").get<std::string>())
-      return layer.at("rules");
+    if (layer.is_object() &&
+        layer.value("owner", "") == cfg.at("policyUser").get<std::string>())
+      return layer;
   }
-  return Json::array();
+  return Json::object();
+}
+Json userRules() { return savedPolicy(policy()).value("rules", Json::array()); }
+bool autolaunch(const Json &cfg, const Json &layer) {
+  return layer.value("autolaunch", cfg.value("autolaunch", false));
 }
 void applyRules(const Json &rules, const Json &cfg) {
   require(rules.is_array() && rules.size() <= 256, "up to 256 rules allowed");
@@ -260,6 +264,8 @@ Json handle(const Json &j, uid_t uid) {
                                                  : service},
                  {"selected", selected()},
                  {"killSwitch", cfg.at("killSwitch")},
+                 {"autolaunch", autolaunch(cfg, savedPolicy(cfg))},
+                 {"baseAutolaunch", cfg.value("autolaunch", false)},
                  {"profiles", rows},
                  {"rules", userRules()},
                  {"allowDirectProbe", cfg.at("policyUser") == user},
@@ -328,14 +334,29 @@ Json handle(const Json &j, uid_t uid) {
   if (op == "sync") {
     require(cfg.at("policyUser") == user,
             "administrator has not delegated routing policy");
-    auto old = userRules();
-    auto r = j.at("rules");
+    auto layer = savedPolicy(cfg);
+    if (j.contains("autolaunch")) {
+      if (j.at("autolaunch").is_null())
+        layer.erase("autolaunch");
+      else {
+        require(j.at("autolaunch").is_boolean(), "autolaunch must be boolean");
+        layer["autolaunch"] = j.at("autolaunch");
+      }
+    }
+    auto old = layer.value("rules", Json::array());
+    require(j.contains("rules") || j.contains("autolaunch"),
+            "no settings supplied");
+    auto r = j.value("rules", old);
     try {
-      applyRules(r, cfg);
-      write(state / "rules.json", Json{{"owner", user}, {"rules", r}}.dump());
+      if (j.contains("rules"))
+        applyRules(r, cfg);
+      layer["owner"] = user;
+      layer["rules"] = r;
+      write(state / "rules.json", layer.dump());
     } catch (...) {
       logEvent("Routing: update failed; restoring previous rules", LOG_WARNING);
-      applyRules(old, cfg);
+      if (j.contains("rules"))
+        applyRules(old, cfg);
       throw;
     }
     event("Routing: applied " + std::to_string(r.size()) + " user rules");
@@ -515,11 +536,12 @@ int main(int argc, char **argv) {
     return 1;
   }
   try {
+    bool boot = argc == 2 && std::string_view(argv[1]) == "autolaunch";
     bool refresh = argc == 2 && std::string(argv[1]) == "refresh";
     Json j;
     ucred peer{};
     socklen_t size = sizeof peer;
-    if (!refresh) {
+    if (!refresh && !boot) {
       require(getsockopt(0, SOL_SOCKET, SO_PEERCRED, &peer, &size) == 0,
               "expected systemd socket");
       timeval tv{4, 0};
@@ -538,7 +560,21 @@ int main(int argc, char **argv) {
         open((state / "lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     require(lock >= 0 && flock(lock, LOCK_EX) == 0, "state lock failed");
     fs::create_directories(profiles);
-    if (refresh) {
+    if (boot) {
+      auto cfg = policy();
+      if (autolaunch(cfg, savedPolicy(cfg)) && !selected().empty()) {
+        recoverSwitch();
+        applyRules(userRules(), cfg);
+        logEvent("Autolaunch: starting last successful profile");
+        if (!ctl("start") || !initialized()) {
+          require(ctl("stop"), "cannot stop failed boot connection");
+          releaseGuard();
+          write(state / "last-error", "Autolaunch failed; see Logs");
+          throw std::runtime_error("Autolaunch failed; see Logs");
+        }
+        event("Autolaunch: tunnel ready");
+      }
+    } else if (refresh) {
       recoverSwitch();
       applyRules(userRules(), policy());
     } else

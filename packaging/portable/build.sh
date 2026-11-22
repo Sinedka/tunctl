@@ -20,8 +20,16 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 prefix=/opt/vpnctl/current
 stage=$work/stage
+# Build the same pinned TUI as the flake, including on Debian 12.
+curl -fsSL --retry 3 -o "$work/ftxui.tar.gz" https://codeload.github.com/ArthurSonzogni/FTXUI/tar.gz/refs/tags/v7.0.3
+echo "e7c62ffe19009759821b4f0f8df7f2a6fb83784c3a9f1477d81f56d3ee723c88  $work/ftxui.tar.gz" | sha256sum -c -
+tar -xf "$work/ftxui.tar.gz" -C "$work"
+cmake -S "$work/FTXUI-7.0.3" -B "$work/ftxui-build" -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX="$work/deps"
+cmake --build "$work/ftxui-build" --parallel "${BUILD_JOBS:-2}"
+cmake --install "$work/ftxui-build"
 cmake -S "$src" -B "$work/build" -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DVPNCTL_NATIVE_SYSTEMD=ON -DVPNCTL_PORTABLE=ON
+    -DCMAKE_PREFIX_PATH="$work/deps" -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DVPNCTL_NATIVE_SYSTEMD=ON -DVPNCTL_PORTABLE=ON
 cmake --build "$work/build" --parallel "${BUILD_JOBS:-2}"
 ctest --test-dir "$work/build" --output-on-failure
 DESTDIR="$stage" cmake --install "$work/build" --strip
@@ -30,6 +38,7 @@ name=vpnctl-${version:?}-$arch
 bundle=$work/$name
 mv "$stage$prefix" "$bundle"
 cd "$bundle"
+install -Dm644 "$work/FTXUI-7.0.3/LICENSE" share/licenses/ftxui/LICENSE
 install -d lib/vpnctl
 for binary in bin/vpnctl bin/vpnctl-daemon; do
     libs=$(ldd "$binary")

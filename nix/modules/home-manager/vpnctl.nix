@@ -1,4 +1,4 @@
-{
+args@{
   config,
   lib,
   pkgs,
@@ -12,6 +12,7 @@ let
     lib.mkOption { inherit type default description; };
   inherit (lib) types;
   apps = cfg.settings.routing.applications;
+  onNixOS = args ? osConfig && args.osConfig ? system && args.osConfig.system ? nixos;
   binary = "${cfg.package}/bin/vpnctl";
 in
 {
@@ -20,6 +21,7 @@ in
     package = opt types.package vpnctlDefault "VPNCTL package.";
     syncOnLogin = opt types.bool false "Send merged routing rules to the privileged backend at login.";
     settings = {
+      autolaunch = opt types.bool (onNixOS && (args.osConfig.services.vpnctl.autolaunch or false || args.osConfig.services.vpnctl.openvpn.autoConnect or false)) "Start the last successful profile at system boot.";
       theme = opt (types.enum [
         "dark"
         "light"
@@ -63,7 +65,7 @@ in
   };
   config = lib.mkIf cfg.enable {
     home.packages = [ cfg.package ];
-    xdg.configFile."vpnctl/settings.json".source = pkgs.runCommand "vpnctl-settings.json" { } ''
+    xdg.configFile."vpnctl/${if onNixOS then "locked" else "settings"}.json".source = pkgs.runCommand "vpnctl-settings.json" { } ''
       cp ${pkgs.writeText "vpnctl-settings-input.json" (builtins.toJSON cfg.settings)} "$out"
       ${binary} check-settings "$out"
     '';

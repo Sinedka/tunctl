@@ -3,7 +3,7 @@ Description=VPNCTL host routing policy
 DefaultDependencies=no
 After=local-fs.target systemd-tmpfiles-setup.service nftables.service
 Before=network-pre.target NetworkManager.service systemd-networkd.service networking.service shutdown.target
-Wants=network-pre.target
+Wants=network-pre.target vpnctl-autolaunch.service
 Conflicts=shutdown.target
 
 [Service]

@@ -77,7 +77,7 @@ cd vpnctl-0.1.0-x86_64
 
 Для вызова команды по имени добавьте `/opt/vpnctl/current/bin` в пользовательский `PATH`.
 
-Для автоподключения последнего выбранного профиля выполните `sudo systemctl enable vpnctl-tunnel.service`. После изменения системного списка IP или kill switch используйте `sudo systemctl reload vpnctl-routing.service`. Вкладка Routing позволяет управлять пользовательскими исключениями. Для маршрутизации приложения добавьте его там и запустите, например, `vpnctl launch firefox firefox`. Для запуска из графического меню используйте ту же команду в пользовательском desktop entry.
+Для подключения последнего успешного профиля при загрузке включите **Settings → Autolaunch**. Если служба туннеля была включена вручную, снимите старый автозапуск командой `sudo systemctl disable vpnctl-tunnel.service`. После изменения системного списка IP или kill switch используйте `sudo systemctl reload vpnctl-routing.service`. Вкладка Routing позволяет управлять пользовательскими исключениями. Для маршрутизации приложения добавьте его там и запустите, например, `vpnctl launch firefox firefox`. Для запуска из графического меню используйте ту же команду в пользовательском desktop entry.
 
 ## Доменная маршрутизация
 
@@ -124,11 +124,11 @@ sudo systemctl daemon-reload
 В Debian 12 установите зависимости сборки:
 
 ```sh
-sudo apt install g++ cmake make nlohmann-json3-dev libssl-dev libncurses-dev \
+sudo apt install g++ cmake make nlohmann-json3-dev libssl-dev ca-certificates \
   patchelf squashfs-tools python3 openssl curl
 ```
 
-В корне проекта скачайте закреплённый runtime для архитектуры сборочной машины. Скрипт сверяет его SHA-256 перед упаковкой. Затем CMake собирает клиент и backend, CTest выполняет проверки, а скрипт записывает оба готовых файла в `build/portable`.
+В корне проекта скачайте закреплённый runtime для архитектуры сборочной машины. Скрипт сверяет его SHA-256 перед упаковкой. Скрипт также скачивает FTXUI 7.0.3, проверяет SHA-256 архива и собирает библиотеку статически. Затем CMake собирает клиент и backend, CTest выполняет проверки, а скрипт записывает оба готовых файла в `build/portable`.
 
 ```sh
 case "$(uname -m)" in

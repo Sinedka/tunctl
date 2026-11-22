@@ -19,6 +19,8 @@ let
   ip = "${pkgs.iproute2}/bin/ip";
   networkHelper = "${pkgs.python3}/bin/python3 ${../../../packaging/network.py.in}";
   unit = "vpnctl-tunnel";
+  delegatedHome = lib.attrByPath [ "home-manager" "users" (if cfg.policyUser == null then "" else cfg.policyUser) "programs" "vpnctl" ] {} config;
+  bootDefault = cfg.autolaunch || cfg.openvpn.autoConnect;
   dns = cfg.routing.directDomains != [ ] || cfg.dns.enable;
   ready = pkgs.writeShellScript "vpnctl-ready" ''
     set -eu
@@ -58,6 +60,7 @@ in
       opt (types.nullOr types.str) null
         "Single trusted operator allowed to submit host-wide routing exceptions.";
     openvpn.enable = opt types.bool true "Enable the managed OpenVPN client.";
+    autolaunch = opt types.bool false "Start the last successful VPN profile on boot by default.";
     openvpn.autoConnect = opt types.bool false "Connect the last selected profile on boot.";
     routing.default = opt (types.enum [ "vpn" ]) "vpn" "Default action during a connection.";
     routing.killSwitch =
@@ -98,9 +101,13 @@ in
     ];
     environment.systemPackages = [ cfg.package ];
     users.groups.vpnctl.members = cfg.operators;
+    environment.etc."vpnctl/locked.json" = lib.mkIf (!(delegatedHome.enable or false)) {
+      text = builtins.toJSON { autolaunch = bootDefault; };
+    };
     environment.etc."vpnctl/policy.json".text = builtins.toJSON {
       inherit (cfg) operators;
       inherit dns;
+      autolaunch = if delegatedHome.enable or false then delegatedHome.settings.autolaunch else bootDefault;
       inherit (cfg.dns) upstreams bootstrapDNS;
       policyUser = if cfg.policyUser == null then "" else cfg.policyUser;
       inherit (cfg.routing) killSwitch directIPs directDomains;
@@ -199,9 +206,17 @@ in
         ExecStop = "${pkgs.nftables}/bin/nft destroy table inet vpnctl_session";
       };
     };
+    systemd.services.vpnctl-autolaunch = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "vpnctl-routing.service" "network-online.target" ];
+      wants = [ "network-online.target" ];
+      requires = [ "vpnctl-routing.service" ];
+      restartIfChanged = false;
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; ExecStart = "${daemon} autolaunch"; };
+    };
     systemd.services.${unit} = {
       path = [ pkgs.iproute2 pkgs.nftables ];
-      wantedBy = lib.optional cfg.openvpn.autoConnect "multi-user.target";
+
       after = [
         "network-online.target"
         "vpnctl-session.service"
